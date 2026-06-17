@@ -9,8 +9,8 @@ final class EmailDetailViewController: NSViewController {
     private lazy var headerView: NSView = {
         let v = NSView()
         v.translatesAutoresizingMaskIntoConstraints = false
-        v.wantsLayer = true
-        v.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        // No custom background — let the popover material show through so it
+        // stays consistent in both light and dark mode.
         return v
     }()
 

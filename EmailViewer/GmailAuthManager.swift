@@ -1,6 +1,11 @@
 import AuthenticationServices
 import CryptoKit
 
+extension Notification.Name {
+    /// Posted (on the main thread) whenever sign-in or sign-out completes.
+    static let gmailAuthChanged = Notification.Name("gmailAuthChanged")
+}
+
 // MARK: - Configuration (nonisolated: shared by the main-actor manager and the token actor)
 
 enum GmailConfig {
@@ -107,6 +112,7 @@ final class GmailAuthManager: NSObject {  // must inherit NSObject for ASWebAuth
         hasSession = true
         cancelPending()
         print("✅ Signed in")
+        NotificationCenter.default.post(name: .gmailAuthChanged, object: nil)
     }
 
     private func cancelPending() {
@@ -135,6 +141,7 @@ final class GmailAuthManager: NSObject {  // must inherit NSObject for ASWebAuth
         KeychainHelper.delete(key: GmailConfig.Keys.expiry)
         Task { await GmailTokenStore.shared.clearMemory() }
         print("👋 Signed out")
+        NotificationCenter.default.post(name: .gmailAuthChanged, object: nil)
     }
 
     // MARK: PKCE utilities

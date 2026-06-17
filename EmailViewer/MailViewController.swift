@@ -6,24 +6,22 @@ final class MailViewController: NSViewController {
     /// Called when the user taps an email; the container handles navigation.
     var onSelectEmail: ((Email) -> Void)?
 
-    private var emails:    [Email] = []
+    private var allEmails: [Email] = []     // full inbox
+    private var emails:    [Email] = []     // filtered/displayed
+    private var searchQuery = ""
     private var isLoading = false
+
     // MARK: - Views
 
-    private lazy var headerView: NSView = {
-        let v = NSView()
-        v.translatesAutoresizingMaskIntoConstraints = false
-        v.wantsLayer = true
-        v.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-        return v
-    }()
-
-    private lazy var titleLabel: NSTextField = {
-        let l = NSTextField(labelWithString: "Inbox")
-        l.translatesAutoresizingMaskIntoConstraints = false
-        l.font = .boldSystemFont(ofSize: 13)
-        l.textColor = .labelColor
-        return l
+    private lazy var searchField: NSSearchField = {
+        let f = NSSearchField()
+        f.translatesAutoresizingMaskIntoConstraints = false
+        f.placeholderString = "Search mail"
+        f.delegate = self
+        f.focusRingType = .none
+        f.sendsWholeSearchString = false
+        f.sendsSearchStringImmediately = false
+        return f
     }()
 
     private lazy var refreshButton: NSButton = {
@@ -35,14 +33,7 @@ final class MailViewController: NSViewController {
         b.bezelStyle = .texturedRounded
         b.isBordered = false
         b.contentTintColor = .secondaryLabelColor
-        return b
-    }()
-    
-
-    private lazy var connectButton: NSButton = {
-        let b = NSButton(title: "Connect Gmail", target: self, action: #selector(connectGmail))
-        b.translatesAutoresizingMaskIntoConstraints = false
-        b.bezelStyle = .rounded
+        b.toolTip = "Refresh"
         return b
     }()
 
@@ -53,7 +44,7 @@ final class MailViewController: NSViewController {
         return p
     }()
 
-    private lazy var divider: NSBox = {
+    private lazy var topDivider: NSBox = {
         let b = NSBox()
         b.translatesAutoresizingMaskIntoConstraints = false
         b.boxType = .separator
@@ -68,6 +59,7 @@ final class MailViewController: NSViewController {
         sv.horizontalScrollElasticity = .none
         sv.borderType      = .noBorder
         sv.backgroundColor = .clear
+        sv.drawsBackground = false
         return sv
     }()
 
@@ -87,29 +79,47 @@ final class MailViewController: NSViewController {
         return tv
     }()
 
-    // Doubles as empty-inbox and error/status message.
+    // Status text shown when the list is empty (no mail, no matches, errors).
     private lazy var emptyLabel: NSTextField = {
         let l = NSTextField(wrappingLabelWithString: "No emails")
-        l.translatesAutoresizingMaskIntoConstraints = false
         l.font = .systemFont(ofSize: 13)
         l.textColor = .tertiaryLabelColor
         l.alignment = .center
         l.maximumNumberOfLines = 0
-        l.preferredMaxLayoutWidth = 300
         l.isHidden = true
         return l
+    }()
+
+    private lazy var connectButton: NSButton = {
+        let b = NSButton(title: "Connect Gmail", target: self, action: #selector(connectGmail))
+        b.bezelStyle = .rounded
+        b.controlSize = .large
+        b.keyEquivalent = "\r"
+        b.isHidden = true
+        return b
+    }()
+
+    private lazy var emptyStack: NSStackView = {
+        let s = NSStackView(views: [emptyLabel, connectButton])
+        s.translatesAutoresizingMaskIntoConstraints = false
+        s.orientation = .vertical
+        s.alignment = .centerX
+        s.spacing = 14
+        return s
     }()
 
     // MARK: - Lifecycle
 
     override func loadView() {
-        view = NSView(frame: NSRect(origin: .zero, size: NSSize(width: 360, height: 500)))
+        view = NSView(frame: NSRect(origin: .zero, size: NSSize(width: 440, height: 560)))
         view.wantsLayer = true
     }
 
     override func viewDidLoad() {
         super.viewDidLoad()
         buildLayout()
+        NotificationCenter.default.addObserver(self, selector: #selector(authChanged),
+                                               name: .gmailAuthChanged, object: nil)
         updateUI()
     }
 
@@ -119,17 +129,11 @@ final class MailViewController: NSViewController {
         Task {
             // Show cached emails (memory or disk) immediately, with no network hit.
             let cached = await GmailFetcher.shared.currentEmails()
-            if !cached.isEmpty {
-                self.emails = cached
-                self.tableView.reloadData()
-                self.showStatus(nil)
-            }
-            // Only go to the network when we have nothing, or the cache is stale —
-            // not on every menu-bar click.
+            if !cached.isEmpty { self.setEmails(cached) }
+
+            // Only go to the network when we have nothing, or the cache is stale.
             let stale = await GmailFetcher.shared.isListStale(maxAge: 300)
-            if cached.isEmpty || stale {
-                self.loadEmails(forceRefresh: true)
-            }
+            if cached.isEmpty || stale { self.loadEmails(forceRefresh: true) }
         }
     }
 
@@ -138,82 +142,116 @@ final class MailViewController: NSViewController {
     private func buildLayout() {
         scrollView.documentView = tableView
 
-        view.addSubview(headerView)
-        headerView.addSubview(titleLabel)
-        headerView.addSubview(refreshButton)
-        headerView.addSubview(spinner)
-        headerView.addSubview(connectButton)
-        view.addSubview(divider)
-        view.addSubview(scrollView)
-        view.addSubview(emptyLabel)
+        [searchField, refreshButton, spinner, topDivider, scrollView, emptyStack].forEach(view.addSubview)
 
         NSLayoutConstraint.activate([
-            headerView.topAnchor.constraint(equalTo: view.topAnchor),
-            headerView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            headerView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            headerView.heightAnchor.constraint(equalToConstant: 44),
+            searchField.topAnchor.constraint(equalTo: view.topAnchor, constant: 10),
+            searchField.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+            searchField.trailingAnchor.constraint(equalTo: refreshButton.leadingAnchor, constant: -8),
+            searchField.heightAnchor.constraint(equalToConstant: 24),
 
-            titleLabel.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
-            titleLabel.leadingAnchor.constraint(equalTo: headerView.leadingAnchor, constant: 14),
+            refreshButton.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+            refreshButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
+            refreshButton.widthAnchor.constraint(equalToConstant: 26),
+            refreshButton.heightAnchor.constraint(equalToConstant: 26),
 
-            refreshButton.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
-            refreshButton.trailingAnchor.constraint(equalTo: headerView.trailingAnchor, constant: -10),
-            refreshButton.widthAnchor.constraint(equalToConstant: 28),
-            refreshButton.heightAnchor.constraint(equalToConstant: 28),
+            spinner.centerYAnchor.constraint(equalTo: refreshButton.centerYAnchor),
+            spinner.centerXAnchor.constraint(equalTo: refreshButton.centerXAnchor),
 
-            spinner.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
-            spinner.trailingAnchor.constraint(equalTo: headerView.trailingAnchor, constant: -10),
+            topDivider.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 10),
+            topDivider.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            topDivider.trailingAnchor.constraint(equalTo: view.trailingAnchor),
 
-            connectButton.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
-            connectButton.trailingAnchor.constraint(equalTo: headerView.trailingAnchor, constant: -10),
-
-            divider.topAnchor.constraint(equalTo: headerView.bottomAnchor),
-            divider.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            divider.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-
-            scrollView.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            scrollView.topAnchor.constraint(equalTo: topDivider.bottomAnchor),
             scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
-            emptyLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            emptyLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            emptyStack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            emptyStack.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor),
+            emptyStack.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 30),
+            emptyStack.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -30),
         ])
+    }
+
+    // MARK: - Data & search
+
+    private func setEmails(_ list: [Email]) {
+        allEmails = list
+        applyFilter()
+    }
+
+    private func applyFilter() {
+        let query = searchQuery.trimmingCharacters(in: .whitespaces)
+        if query.isEmpty {
+            emails = allEmails
+        } else {
+            emails = allEmails
+                .compactMap { email -> (Email, Int)? in
+                    guard let score = FuzzySearch.bestScore(
+                        query: query,
+                        in: [email.senderName, email.sender, email.subject, email.snippet]
+                    ) else { return nil }
+                    return (email, score)
+                }
+                .sorted { $0.1 > $1.1 }
+                .map(\.0)
+        }
+        tableView.reloadData()
+        updateEmptyState()
+    }
+
+    private func updateEmptyState() {
+        guard GmailAuthManager.shared.isAuthenticated() else {
+            connectButton.isHidden = false
+            showStatus("Connect your Gmail to view your inbox.")
+            return
+        }
+        connectButton.isHidden = true
+        if !emails.isEmpty {
+            showStatus(nil)
+        } else if isLoading {
+            showStatus(nil)                                   // don't flash "No emails" mid-load
+        } else if !searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
+            showStatus("No matches for “\(searchQuery)”.")
+        } else {
+            showStatus("No emails")
+        }
     }
 
     // MARK: - Actions
 
     @objc private func connectGmail() {
-        if GmailAuthManager.shared.isAuthenticated() {
-            GmailAuthManager.shared.signOut()
-            Task { await GmailFetcher.shared.clearCache() }
-            emails = []; tableView.reloadData(); updateUI()
-        } else {
-            Task {
-                do {
-                    try await GmailAuthManager.shared.startOAuthFlow()
-                    self.updateUI()
-                    self.loadEmails(forceRefresh: true)
-                } catch {
-                    self.handleAuthError(error)
-                }
+        Task {
+            do {
+                try await GmailAuthManager.shared.startOAuthFlow()   // posts .gmailAuthChanged on success
+            } catch {
+                self.handleAuthError(error)
             }
+        }
+    }
+
+    @objc private func authChanged() {
+        updateUI()
+        if GmailAuthManager.shared.isAuthenticated() {
+            loadEmails(forceRefresh: true)
+        } else {
+            Task { await GmailFetcher.shared.clearCache() }
+            setEmails([])
         }
     }
 
     @objc private func refresh() { loadEmails(forceRefresh: true) }
 
     func loadEmails(forceRefresh: Bool = false) {
-        guard !isLoading else { return }
+        guard GmailAuthManager.shared.isAuthenticated(), !isLoading else { return }
         setLoading(true)
 
         Task {
             do {
                 let fetched = try await GmailFetcher.shared.fetchEmails(forceRefresh: forceRefresh)
                 await MainActor.run {
-                    self.emails = fetched
-                    self.tableView.reloadData()
-                    self.showStatus(fetched.isEmpty ? "No emails" : nil)
+                    self.setEmails(fetched)
                     self.setLoading(false)
                 }
             } catch {
@@ -229,23 +267,16 @@ final class MailViewController: NSViewController {
 
     private func handleLoadError(_ error: Error) {
         if requiresReauth(error) {
-            GmailAuthManager.shared.signOut()
-            Task { await GmailFetcher.shared.clearCache() }
-            emails = []
-            tableView.reloadData()
-            updateUI()
+            GmailAuthManager.shared.signOut()        // posts .gmailAuthChanged → list clears
             showStatus("Your Gmail session expired.\nPlease reconnect.")
         } else if emails.isEmpty {
-            // Only replace the list with an error when we have nothing to show.
             showStatus((error as? LocalizedError)?.errorDescription ?? "Couldn't load your inbox.")
         }
     }
 
     private func handleAuthError(_ error: Error) {
         // User dismissing the Google sheet isn't an error worth showing.
-        if let asError = error as? ASWebAuthenticationSessionError, asError.code == .canceledLogin {
-            return
-        }
+        if let asError = error as? ASWebAuthenticationSessionError, asError.code == .canceledLogin { return }
         print("❌ Auth failed: \(error)")
         showStatus((error as? LocalizedError)?.errorDescription ?? "Sign-in failed. Please try again.")
     }
@@ -273,17 +304,23 @@ final class MailViewController: NSViewController {
             spinner.stopAnimation(nil); spinner.isHidden = true
             refreshButton.isHidden = !GmailAuthManager.shared.isAuthenticated()
         }
+        updateEmptyState()
     }
 
     func updateUI() {
         let authed = GmailAuthManager.shared.isAuthenticated()
-        connectButton.title    = authed ? "Sign Out" : "Connect Gmail"
+        searchField.isHidden   = !authed
         refreshButton.isHidden = !authed || isLoading
-        if !authed {
-            emails = []
-            tableView.reloadData()
-            showStatus("Connect your Gmail to get started.")
-        }
+        updateEmptyState()
+    }
+}
+
+// MARK: - Search
+
+extension MailViewController: NSSearchFieldDelegate {
+    func controlTextDidChange(_ obj: Notification) {
+        searchQuery = searchField.stringValue
+        applyFilter()
     }
 }
 
@@ -397,4 +434,3 @@ final class EmailCellView: NSView {
         unreadDot.isHidden = email.isRead
     }
 }
-
