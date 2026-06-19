@@ -1,6 +1,11 @@
 import AppKit
 import WebKit
 
+/// Document view that lays out top-to-bottom (AppKit views are bottom-up by default).
+private final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 final class EmailDetailViewController: NSViewController {
 
     private let email: Email
@@ -56,6 +61,13 @@ final class EmailDetailViewController: NSViewController {
         return p
     }()
 
+    private lazy var contentContainer: NSView = {
+        let v = NSView()
+        v.translatesAutoresizingMaskIntoConstraints = false
+        return v
+    }()
+
+    /// Created lazily — ONLY for HTML emails, so plain-text mail spins up no renderer process.
     private lazy var webView: WKWebView = {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .nonPersistent()
@@ -88,7 +100,7 @@ final class EmailDetailViewController: NSViewController {
         headerView.addSubview(trashButton)
         headerView.addSubview(spinner)
         view.addSubview(divider)
-        view.addSubview(webView)
+        view.addSubview(contentContainer)
 
         NSLayoutConstraint.activate([
             headerView.topAnchor.constraint(equalTo: view.topAnchor),
@@ -111,10 +123,10 @@ final class EmailDetailViewController: NSViewController {
             divider.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             divider.trailingAnchor.constraint(equalTo: view.trailingAnchor),
 
-            webView.topAnchor.constraint(equalTo: divider.bottomAnchor),
-            webView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            webView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            contentContainer.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            contentContainer.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            contentContainer.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            contentContainer.bottomAnchor.constraint(equalTo: view.bottomAnchor),
         ])
 
         loadEmail()
@@ -131,15 +143,49 @@ final class EmailDetailViewController: NSViewController {
                 await MainActor.run {
                     self.attachments = content.attachments
                     self.stopSpinner()
-                    self.webView.loadHTMLString(self.htmlDocument(for: content), baseURL: nil)
+                    self.render(content)
                 }
             } catch {
                 await MainActor.run {
                     self.stopSpinner()
-                    self.webView.loadHTMLString(self.errorDocument(for: error), baseURL: nil)
+                    let message = (error as? LocalizedError)?.errorDescription ?? "Could not load this email."
+                    self.installMessage(message)
                 }
             }
         }
+    }
+
+    /// Rich HTML → WebView. Plain text (or trivial HTML that adds no formatting)
+    /// → native rendering, so no WKWebView/renderer process is created.
+    private func render(_ content: EmailContent) {
+        if let html = content.body.html, !html.isEmpty, Self.isRichHTML(html) {
+            installWebView()
+            webView.loadHTMLString(htmlDocument(html: html, attachments: content.attachments), baseURL: nil)
+        } else {
+            let text = content.body.plainText
+                ?? content.body.html.map(Self.strippedText)
+                ?? "This message has no content."
+            installPlainView(text: text, attachments: content.attachments)
+        }
+    }
+
+    /// True only when the HTML carries real formatting/structure worth a WebView.
+    /// Gmail wraps even plain typed text as `<div dir="ltr">…</div>` (multipart
+    /// alternative), which must NOT trigger the WebView.
+    nonisolated private static func isRichHTML(_ html: String) -> Bool {
+        let h = html.lowercased()
+        let markers = ["<img", "<table", "<a ", "href=", "<ul", "<ol",
+                       "<h1", "<h2", "<h3", "<h4", "<h5", "<h6", "<blockquote",
+                       "<style", "style=", "<hr", "<font", "bgcolor", "background",
+                       "<b>", "<strong", "<em", "<i>", "<u>", "<button", "<svg", "<video"]
+        return markers.contains { h.contains($0) }
+    }
+
+    nonisolated private static func strippedText(_ html: String) -> String {
+        var s = html.replacingOccurrences(of: "(?i)<br\\s*/?>", with: "\n", options: .regularExpression)
+        s = s.replacingOccurrences(of: "(?i)</(p|div)>", with: "\n", options: .regularExpression)
+        s = s.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+        return s.htmlUnescaped.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func stopSpinner() {
@@ -183,7 +229,120 @@ final class EmailDetailViewController: NSViewController {
         }
     }
 
-    // MARK: - Attachments (downloaded via an `attachment://download/<index>` link)
+    // MARK: - Content installation
+
+    private func installWebView() {
+        contentContainer.addSubview(webView)
+        pin(webView, to: contentContainer)
+    }
+
+    private func installMessage(_ text: String) {
+        let label = wrapLabel(text, font: .systemFont(ofSize: 13), color: .secondaryLabelColor)
+        label.alignment = .center
+        contentContainer.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: contentContainer.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: contentContainer.centerYAnchor),
+            label.leadingAnchor.constraint(greaterThanOrEqualTo: contentContainer.leadingAnchor, constant: 24),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: contentContainer.trailingAnchor, constant: -24),
+        ])
+    }
+
+    /// Native plain-text rendering: subject, meta, body, and attachment chips in a
+    /// scrolling stack — no WKWebView, so no renderer process.
+    private func installPlainView(text: String, attachments: [EmailAttachment]) {
+        let pad: CGFloat = 16
+        let doc = FlippedView()
+        doc.translatesAutoresizingMaskIntoConstraints = false
+
+        let subject = wrapLabel(email.subject, font: .boldSystemFont(ofSize: 15), color: .labelColor)
+        let meta    = wrapLabel("\(email.senderName) · \(email.relativeDate)",
+                                font: .systemFont(ofSize: 11), color: .secondaryLabelColor)
+        let sep = NSBox(); sep.boxType = .separator; sep.translatesAutoresizingMaskIntoConstraints = false
+        let body = wrapLabel(text.isEmpty ? "This message has no content." : text,
+                             font: .systemFont(ofSize: 13), color: .labelColor)
+        body.isSelectable = true
+
+        [subject, meta, sep, body].forEach { doc.addSubview($0) }
+
+        NSLayoutConstraint.activate([
+            subject.topAnchor.constraint(equalTo: doc.topAnchor, constant: pad),
+            subject.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: pad),
+            subject.trailingAnchor.constraint(equalTo: doc.trailingAnchor, constant: -pad),
+
+            meta.topAnchor.constraint(equalTo: subject.bottomAnchor, constant: 4),
+            meta.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: pad),
+            meta.trailingAnchor.constraint(equalTo: doc.trailingAnchor, constant: -pad),
+
+            sep.topAnchor.constraint(equalTo: meta.bottomAnchor, constant: 12),
+            sep.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: pad),
+            sep.trailingAnchor.constraint(equalTo: doc.trailingAnchor, constant: -pad),
+
+            body.topAnchor.constraint(equalTo: sep.bottomAnchor, constant: 12),
+            body.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: pad),
+            body.trailingAnchor.constraint(equalTo: doc.trailingAnchor, constant: -pad),
+        ])
+
+        var lastBottom = body.bottomAnchor
+        if !attachments.isEmpty {
+            let title = wrapLabel("ATTACHMENTS", font: .systemFont(ofSize: 10, weight: .semibold),
+                                  color: .secondaryLabelColor)
+            doc.addSubview(title)
+            NSLayoutConstraint.activate([
+                title.topAnchor.constraint(equalTo: lastBottom, constant: 20),
+                title.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: pad),
+                title.trailingAnchor.constraint(equalTo: doc.trailingAnchor, constant: -pad),
+            ])
+            lastBottom = title.bottomAnchor
+
+            for (index, att) in attachments.enumerated() {
+                let chip = attachmentChip(att, index: index)
+                doc.addSubview(chip)
+                NSLayoutConstraint.activate([
+                    chip.topAnchor.constraint(equalTo: lastBottom, constant: 8),
+                    chip.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: pad),
+                    chip.trailingAnchor.constraint(lessThanOrEqualTo: doc.trailingAnchor, constant: -pad),
+                ])
+                lastBottom = chip.bottomAnchor
+            }
+        }
+        doc.bottomAnchor.constraint(equalTo: lastBottom, constant: pad).isActive = true
+
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.drawsBackground = false
+        scroll.documentView = doc
+
+        contentContainer.addSubview(scroll)
+        pin(scroll, to: contentContainer)
+        NSLayoutConstraint.activate([
+            doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            doc.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+            doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+        ])
+    }
+
+    // MARK: - Attachments
+
+    private func attachmentChip(_ att: EmailAttachment, index: Int) -> NSButton {
+        let b = NSButton(title: " \(att.filename)  ·  \(att.displaySize)",
+                         image: NSImage(systemSymbolName: "paperclip", accessibilityDescription: "Attachment") ?? NSImage(),
+                         target: self, action: #selector(downloadAttachmentButton(_:)))
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.imagePosition = .imageLeading
+        b.bezelStyle = .rounded
+        b.controlSize = .small
+        b.font = .systemFont(ofSize: 11)
+        b.tag = index
+        b.toolTip = "Save \(att.filename)"
+        return b
+    }
+
+    @objc private func downloadAttachmentButton(_ sender: NSButton) {
+        downloadAttachment(at: sender.tag)
+    }
 
     private func downloadAttachment(at index: Int) {
         guard index >= 0, index < attachments.count else { return }
@@ -209,18 +368,31 @@ final class EmailDetailViewController: NSViewController {
         }
     }
 
-    // MARK: - HTML rendering
+    // MARK: - Helpers
 
-    private func htmlDocument(for content: EmailContent) -> String {
-        let bodyHTML: String
-        if let html = content.body.html, !html.isEmpty {
-            bodyHTML = html
-        } else if let text = content.body.plainText, !text.isEmpty {
-            bodyHTML = "<pre class='plain'>\(text.htmlEscaped)</pre>"
-        } else {
-            bodyHTML = "<p class='empty'>This message has no content.</p>"
-        }
-        return page(content: bodyHTML + attachmentsHTML(content.attachments))
+    private func pin(_ child: NSView, to parent: NSView) {
+        NSLayoutConstraint.activate([
+            child.topAnchor.constraint(equalTo: parent.topAnchor),
+            child.leadingAnchor.constraint(equalTo: parent.leadingAnchor),
+            child.trailingAnchor.constraint(equalTo: parent.trailingAnchor),
+            child.bottomAnchor.constraint(equalTo: parent.bottomAnchor),
+        ])
+    }
+
+    private func wrapLabel(_ string: String, font: NSFont, color: NSColor) -> NSTextField {
+        let l = NSTextField(wrappingLabelWithString: string)
+        l.translatesAutoresizingMaskIntoConstraints = false
+        l.font = font
+        l.textColor = color
+        l.isSelectable = false
+        l.drawsBackground = false
+        return l
+    }
+
+    // MARK: - HTML rendering (HTML emails only)
+
+    private func htmlDocument(html: String, attachments: [EmailAttachment]) -> String {
+        page(content: html + attachmentsHTML(attachments))
     }
 
     private func attachmentsHTML(_ attachments: [EmailAttachment]) -> String {
@@ -231,11 +403,6 @@ final class EmailDetailViewController: NSViewController {
                      + "📎 \(att.filename.htmlEscaped) <span class='att-size'>· \(att.displaySize)</span></a>"
         }
         return section + "</div>"
-    }
-
-    private func errorDocument(for error: Error) -> String {
-        let message = (error as? LocalizedError)?.errorDescription ?? "Could not load this email."
-        return page(content: "<p class='empty'>\(message.htmlEscaped)</p>")
     }
 
     private func page(content: String) -> String {
@@ -262,8 +429,6 @@ final class EmailDetailViewController: NSViewController {
           .subject { font-size:15px; font-weight:700; color:\(sub); margin-bottom:4px; }
           .meta    { font-size:11px; color:\(meta); margin-bottom:14px;
                      padding-bottom:12px; border-bottom:1px solid \(border); }
-          .empty   { color:\(meta); }
-          .plain   { white-space:pre-wrap; font-family:-apple-system,sans-serif; margin:0; }
           img      { max-width:100%; height:auto; }
           table    { max-width:100%; }
           pre      { white-space:pre-wrap; }
@@ -294,7 +459,6 @@ extension EmailDetailViewController: WKNavigationDelegate {
                  decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         if let url = navigationAction.request.url {
-            // Our in-email attachment links: attachment://download/<index>
             if url.scheme == "attachment" {
                 if let last = url.pathComponents.last, let index = Int(last) {
                     downloadAttachment(at: index)
@@ -302,7 +466,6 @@ extension EmailDetailViewController: WKNavigationDelegate {
                 decisionHandler(.cancel)
                 return
             }
-            // Real link clicks open in the browser, not inside the popover.
             if navigationAction.navigationType == .linkActivated {
                 NSWorkspace.shared.open(url)
                 decisionHandler(.cancel)
