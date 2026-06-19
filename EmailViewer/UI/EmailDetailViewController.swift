@@ -193,6 +193,28 @@ final class EmailDetailViewController: NSViewController {
         return s.htmlUnescaped.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Plain text → attributed string with clickable links/emails found by
+    /// NSDataDetector. A selectable NSTextField opens `.link` attributes in the
+    /// browser (or mail client for mailto:) on click — no extra handling needed.
+    private static func linkified(_ text: String) -> NSAttributedString {
+        let result = NSMutableAttributedString(string: text, attributes: [
+            .font: NSFont.systemFont(ofSize: 13),
+            .foregroundColor: NSColor.labelColor,
+        ])
+        let full = NSRange(location: 0, length: (text as NSString).length)
+        if let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) {
+            detector.enumerateMatches(in: text, options: [], range: full) { match, _, _ in
+                guard let url = match?.url, let range = match?.range else { return }
+                result.addAttributes([
+                    .link: url,
+                    .foregroundColor: NSColor.linkColor,
+                    .underlineStyle: NSUnderlineStyle.single.rawValue,
+                ], range: range)
+            }
+        }
+        return result
+    }
+
     private func stopSpinner() {
         spinner.stopAnimation(nil)
         spinner.isHidden = true
@@ -279,9 +301,9 @@ final class EmailDetailViewController: NSViewController {
         let meta    = wrapLabel("\(email.senderName) · \(email.relativeDate)",
                                 font: .systemFont(ofSize: 11), color: .secondaryLabelColor)
         let sep = NSBox(); sep.boxType = .separator; sep.translatesAutoresizingMaskIntoConstraints = false
-        let body = wrapLabel(text.isEmpty ? "This message has no content." : text,
-                             font: .systemFont(ofSize: 13), color: .labelColor)
-        body.isSelectable = true
+        let body = wrapLabel("", font: .systemFont(ofSize: 13), color: .labelColor)
+        body.isSelectable = true   // required for link clicks
+        body.attributedStringValue = Self.linkified(text.isEmpty ? "This message has no content." : text)
 
         [subject, meta, sep, body].forEach { doc.addSubview($0) }
 
