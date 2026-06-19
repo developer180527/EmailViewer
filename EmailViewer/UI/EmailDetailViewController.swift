@@ -193,9 +193,31 @@ final class EmailDetailViewController: NSViewController {
         return s.htmlUnescaped.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Plain text → attributed string with clickable links/emails found by
-    /// NSDataDetector. A selectable NSTextField opens `.link` attributes in the
-    /// browser (or mail client for mailto:) on click — no extra handling needed.
+    /// Read-only, self-sizing NSTextView (NSTextField doesn't open link clicks).
+    /// Links come from NSDataDetector; the click is handled in the delegate.
+    private func makeBodyTextView(_ text: String) -> NSTextView {
+        let tv = LinkTextView()
+        tv.translatesAutoresizingMaskIntoConstraints = false
+        tv.isEditable   = false
+        tv.isSelectable = true
+        tv.drawsBackground = false
+        tv.textContainerInset = .zero
+        tv.textContainer?.lineFragmentPadding = 0
+        tv.textContainer?.widthTracksTextView = true
+        tv.isVerticallyResizable   = true
+        tv.isHorizontallyResizable = false
+        tv.delegate = self
+        tv.linkTextAttributes = [
+            .foregroundColor: NSColor.linkColor,
+            .underlineStyle:  NSUnderlineStyle.single.rawValue,
+            .cursor:          NSCursor.pointingHand,
+        ]
+        tv.textStorage?.setAttributedString(Self.linkified(text))
+        return tv
+    }
+
+    /// Plain text → attributed string with `.link` attributes for URLs/emails
+    /// found by NSDataDetector.
     private static func linkified(_ text: String) -> NSAttributedString {
         let result = NSMutableAttributedString(string: text, attributes: [
             .font: NSFont.systemFont(ofSize: 13),
@@ -301,9 +323,7 @@ final class EmailDetailViewController: NSViewController {
         let meta    = wrapLabel("\(email.senderName) · \(email.relativeDate)",
                                 font: .systemFont(ofSize: 11), color: .secondaryLabelColor)
         let sep = NSBox(); sep.boxType = .separator; sep.translatesAutoresizingMaskIntoConstraints = false
-        let body = wrapLabel("", font: .systemFont(ofSize: 13), color: .labelColor)
-        body.isSelectable = true   // required for link clicks
-        body.attributedStringValue = Self.linkified(text.isEmpty ? "This message has no content." : text)
+        let body = makeBodyTextView(text.isEmpty ? "This message has no content." : text)
 
         [subject, meta, sep, body].forEach { doc.addSubview($0) }
 
@@ -524,6 +544,38 @@ final class EmailDetailViewController: NSViewController {
         </body>
         </html>
         """
+    }
+}
+
+// MARK: - Plain-text links: open in the browser on click
+
+extension EmailDetailViewController: NSTextViewDelegate {
+    func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        let url = (link as? URL) ?? (link as? String).flatMap { URL(string: $0) }
+        if let url { NSWorkspace.shared.open(url) }
+        return true   // handled
+    }
+}
+
+/// NSTextView that reports its laid-out text height so it sizes under Auto Layout.
+private final class LinkTextView: NSTextView {
+    override var intrinsicContentSize: NSSize {
+        guard let container = textContainer, let manager = layoutManager else {
+            return super.intrinsicContentSize
+        }
+        manager.ensureLayout(for: container)
+        return NSSize(width: NSView.noIntrinsicMetric,
+                      height: ceil(manager.usedRect(for: container).height))
+    }
+
+    override func didChangeText() {
+        super.didChangeText()
+        invalidateIntrinsicContentSize()
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        invalidateIntrinsicContentSize()   // re-measure height once the width settles
     }
 }
 
