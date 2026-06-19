@@ -87,7 +87,8 @@ final class RootViewController: NSViewController {
 
     private func pushDetail(for email: Email) {
         let detail = EmailDetailViewController(email: email)
-        detail.onBack = { [weak self] in self?.popToList() }
+        detail.onBack    = { [weak self] in self?.popToList() }
+        detail.onDeleted = { [weak self] in self?.popToList() }   // email already removed + list refreshed
         show(detail)
     }
 

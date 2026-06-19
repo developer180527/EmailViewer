@@ -19,6 +19,25 @@ enum InboxFilter: CaseIterable {
         case .starred: return email.isStarred
         }
     }
+
+    /// Pastel fill used when the chip is selected. Fixed sRGB values so they look
+    /// identical in light and dark mode (and stay light enough for dark text).
+    var selectedFill: NSColor {
+        switch self {
+        case .all:     return NSColor(srgbRed: 0.80, green: 0.89, blue: 1.00, alpha: 1)  // light blue
+        case .unread:  return NSColor(srgbRed: 0.98, green: 0.82, blue: 0.88, alpha: 1)  // light pink
+        case .starred: return NSColor(srgbRed: 1.00, green: 0.89, blue: 0.60, alpha: 1)  // light yellow
+        }
+    }
+
+    /// Dark, high-contrast text for the selected (light) fill — readable in both modes.
+    var selectedText: NSColor {
+        switch self {
+        case .all:     return NSColor(srgbRed: 0.06, green: 0.31, blue: 0.63, alpha: 1)
+        case .unread:  return NSColor(srgbRed: 0.65, green: 0.16, blue: 0.35, alpha: 1)
+        case .starred: return NSColor(srgbRed: 0.48, green: 0.35, blue: 0.00, alpha: 1)
+        }
+    }
 }
 
 /// A row of pill chips for quick inbox filtering.
@@ -46,7 +65,7 @@ final class FilterBar: NSView {
         ])
 
         for filter in InboxFilter.allCases {
-            let chip = ChipButton(title: filter.title)
+            let chip = ChipButton(filter: filter)
             chip.isSelectedChip = (filter == selected)
             chip.onClick = { [weak self] in self?.select(filter) }
             chips[filter] = chip
@@ -71,8 +90,12 @@ final class ChipButton: NSView {
     var isSelectedChip = false { didSet { applyStyle() } }
 
     private let label = NSTextField(labelWithString: "")
+    private let fill:         NSColor
+    private let selectedText: NSColor
 
-    init(title: String) {
+    init(filter: InboxFilter) {
+        self.fill         = filter.selectedFill
+        self.selectedText = filter.selectedText
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
@@ -80,7 +103,7 @@ final class ChipButton: NSView {
         layer?.borderWidth = 0.5
 
         label.translatesAutoresizingMaskIntoConstraints = false
-        label.stringValue = title
+        label.stringValue = filter.title
         label.font = .systemFont(ofSize: 11.5, weight: .medium)
         label.alignment = .center
         addSubview(label)
@@ -108,13 +131,13 @@ final class ChipButton: NSView {
     private func applyStyle() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             if isSelectedChip {
-                layer?.backgroundColor = NSColor.controlAccentColor.cgColor
-                layer?.borderColor     = NSColor.controlAccentColor.cgColor
-                label.textColor         = .white
+                layer?.backgroundColor = fill.cgColor
+                layer?.borderColor     = fill.cgColor
+                label.textColor        = selectedText
             } else {
                 layer?.backgroundColor = NSColor.clear.cgColor
                 layer?.borderColor     = NSColor.separatorColor.cgColor
-                label.textColor         = .secondaryLabelColor
+                label.textColor        = .secondaryLabelColor   // adaptive in both modes
             }
         }
     }

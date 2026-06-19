@@ -13,7 +13,9 @@ extension Notification.Name {
 enum GmailConfig {
     nonisolated static let clientID    = "941618878714-t4buls3u2j9mq2muinecbq0pgqg0afbt.apps.googleusercontent.com"
     nonisolated static let redirectURI = "com.googleusercontent.apps.941618878714-t4buls3u2j9mq2muinecbq0pgqg0afbt:/oauth2callback"
-    nonisolated static let scope       = "https://www.googleapis.com/auth/gmail.readonly"
+    // gmail.modify = read + label/trash (no permanent delete, no send). Needed for
+    // moving messages to Trash. Existing readonly sessions must reconnect to upgrade.
+    nonisolated static let scope       = "https://www.googleapis.com/auth/gmail.modify"
     nonisolated static let tokenURL    = "https://oauth2.googleapis.com/token"
     nonisolated static let authBaseURL = "https://accounts.google.com/o/oauth2/v2/auth"
 

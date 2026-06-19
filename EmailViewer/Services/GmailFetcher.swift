@@ -204,7 +204,12 @@ actor GmailFetcher {
     // MARK: - Fetch full body for a single email
 
     func content(for emailID: String) async throws -> EmailContent {
+        // Memory cache, then disk cache — a previously-opened email never re-hits the API.
         if let cached = contentCache[emailID] { return cached }
+        if let onDisk = loadContentFromDisk(emailID) {
+            rememberContent(onDisk, for: emailID)
+            return onDisk
+        }
 
         let url  = URL(string: "\(baseURL)/messages/\(emailID)?format=full")!
         let data = try await authorizedData(url: url)
@@ -215,18 +220,43 @@ actor GmailFetcher {
         collectAttachments(msg.payload, into: &attachments)
 
         let content = EmailContent(body: body, attachments: attachments)
+        rememberContent(content, for: emailID)
+        saveContentToDisk(content, for: emailID)
+        return content
+    }
+
+    private func rememberContent(_ content: EmailContent, for emailID: String) {
         contentCache[emailID] = content
+        contentOrder.removeAll { $0 == emailID }
         contentOrder.append(emailID)
         if contentOrder.count > maxCachedBodies {
-            let evict = contentOrder.removeFirst()
-            contentCache[evict] = nil
+            contentCache[contentOrder.removeFirst()] = nil
         }
-        return content
     }
 
     /// Downloads a single attachment's bytes (used when the user saves it).
     func attachmentData(emailID: String, attachmentId: String) async -> Data? {
         await fetchAttachment(emailID: emailID, attachmentId: attachmentId)
+    }
+
+    // MARK: - Trash (move to Gmail Trash — reversible; needs gmail.modify scope)
+
+    func trash(_ emailID: String) async throws {
+        let url = URL(string: "\(baseURL)/messages/\(emailID)/trash")!
+        do {
+            _ = try await authorizedData(url: url, method: "POST")
+        } catch let GmailError.http(403, body) {
+            let text = (body ?? "").lowercased()
+            if text.contains("insufficient") || text.contains("scope") {
+                throw GmailError.insufficientScope
+            }
+            throw GmailError.http(403, body)
+        }
+        cachedEmails.removeAll { $0.id == emailID }
+        contentCache[emailID] = nil
+        contentOrder.removeAll { $0 == emailID }
+        deleteContentFromDisk(emailID)
+        saveToDisk()
     }
 
     private func collectAttachments(_ payload: FullMessage.Payload, into list: inout [EmailAttachment]) {
@@ -322,9 +352,14 @@ actor GmailFetcher {
 
     private func clearDisk() {
         if let url = diskURL() { try? FileManager.default.removeItem(at: url) }
+        if let dir = bodiesDir() { try? FileManager.default.removeItem(at: dir) }
     }
 
     private func diskURL() -> URL? {
+        appSupportDir()?.appendingPathComponent("inbox.json")
+    }
+
+    private func appSupportDir() -> URL? {
         let fm = FileManager.default
         guard let base = try? fm.url(for: .applicationSupportDirectory,
                                      in: .userDomainMask,
@@ -332,7 +367,51 @@ actor GmailFetcher {
                                      create: true) else { return nil }
         let dir = base.appendingPathComponent("EmailViewer", isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("inbox.json")
+        return dir
+    }
+
+    // MARK: - Persistent body cache (opened emails survive relaunch, never re-hit the API)
+
+    private let maxDiskBodies = 40
+
+    private func bodiesDir() -> URL? {
+        guard let dir = appSupportDir()?.appendingPathComponent("bodies", isDirectory: true) else { return nil }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private func bodyFile(_ emailID: String) -> URL? {
+        // Message IDs are hex/url-safe, fine as a filename.
+        bodiesDir()?.appendingPathComponent("\(emailID).json")
+    }
+
+    private func loadContentFromDisk(_ emailID: String) -> EmailContent? {
+        guard let url = bodyFile(emailID), let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(EmailContent.self, from: data)
+    }
+
+    private func saveContentToDisk(_ content: EmailContent, for emailID: String) {
+        guard let url = bodyFile(emailID), let data = try? JSONEncoder().encode(content) else { return }
+        try? data.write(to: url, options: .atomic)
+        pruneDiskBodies()
+    }
+
+    private func deleteContentFromDisk(_ emailID: String) {
+        if let url = bodyFile(emailID) { try? FileManager.default.removeItem(at: url) }
+    }
+
+    /// Keep only the most-recently-modified body files.
+    private func pruneDiskBodies() {
+        guard let dir = bodiesDir() else { return }
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]),
+              files.count > maxDiskBodies else { return }
+        let sorted = files.sorted {
+            let a = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            let b = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            return a > b
+        }
+        for file in sorted.dropFirst(maxDiskBodies) { try? fm.removeItem(at: file) }
     }
 
     // MARK: - Authorized request with retry / backoff
@@ -340,9 +419,10 @@ actor GmailFetcher {
     /// Performs an authenticated GET, transparently handling token refresh on
     /// 401, and rate-limit (429 / quota-403) and transient 5xx errors with
     /// exponential backoff. Non-recoverable statuses throw a typed error.
-    private func authorizedData(url: URL, attempt: Int = 0) async throws -> Data {
+    private func authorizedData(url: URL, method: String = "GET", attempt: Int = 0) async throws -> Data {
         let token = try await GmailAuthManager.shared.validToken()
         var request = URLRequest(url: url)
+        request.httpMethod = method
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.timeoutInterval = 30
 
@@ -353,7 +433,7 @@ actor GmailFetcher {
             // Transient transport error (timeout, connection drop): retry a few times.
             guard attempt < maxRetries, (error as? URLError)?.isTransient == true else { throw error }
             try await backoff(attempt: attempt, retryAfter: nil)
-            return try await authorizedData(url: url, attempt: attempt + 1)
+            return try await authorizedData(url: url, method: method, attempt: attempt + 1)
         }
 
         guard let http = response as? HTTPURLResponse else { return data }
@@ -366,25 +446,25 @@ actor GmailFetcher {
             // Refresh once (coalesced across callers) then retry a single time.
             guard attempt == 0 else { throw GmailError.unauthorized }
             _ = try await GmailTokenStore.shared.refresh()
-            return try await authorizedData(url: url, attempt: attempt + 1)
+            return try await authorizedData(url: url, method: method, attempt: attempt + 1)
 
         case 429:
             guard attempt < maxRetries else { throw GmailError.rateLimited }
             try await backoff(attempt: attempt, retryAfter: http.value(forHTTPHeaderField: "Retry-After"))
-            return try await authorizedData(url: url, attempt: attempt + 1)
+            return try await authorizedData(url: url, method: method, attempt: attempt + 1)
 
         case 403:
             // 403 is overloaded: retry only when it's a rate/quota reason.
             if isRateLimitError(data), attempt < maxRetries {
                 try await backoff(attempt: attempt, retryAfter: http.value(forHTTPHeaderField: "Retry-After"))
-                return try await authorizedData(url: url, attempt: attempt + 1)
+                return try await authorizedData(url: url, method: method, attempt: attempt + 1)
             }
             throw GmailError.http(403, String(data: data, encoding: .utf8))
 
         case 500...599:
             guard attempt < maxRetries else { throw GmailError.server(http.statusCode) }
             try await backoff(attempt: attempt, retryAfter: nil)
-            return try await authorizedData(url: url, attempt: attempt + 1)
+            return try await authorizedData(url: url, method: method, attempt: attempt + 1)
 
         default:
             throw GmailError.http(http.statusCode, String(data: data, encoding: .utf8))
@@ -573,6 +653,7 @@ actor GmailFetcher {
         case rateLimited
         case server(Int)
         case http(Int, String?)
+        case insufficientScope
 
         var errorDescription: String? {
             switch self {
@@ -580,12 +661,16 @@ actor GmailFetcher {
             case .rateLimited:  return "Gmail is rate-limiting requests. Try again shortly."
             case .server(let c): return "Gmail had a server error (\(c)). Try again shortly."
             case .http(let c, _): return "Gmail request failed (HTTP \(c))."
+            case .insufficientScope:
+                return "Reconnect Gmail to enable delete (it needs broader permission)."
             }
         }
 
         var requiresReauth: Bool {
-            if case .unauthorized = self { return true }
-            return false
+            switch self {
+            case .unauthorized, .insufficientScope: return true
+            default: return false
+            }
         }
     }
 

@@ -81,6 +81,8 @@ final class MailViewController: NSViewController {
         tv.headerView  = nil
         tv.backgroundColor = .clear
         tv.selectionHighlightStyle = .none
+        tv.style = .plain                 // edge-to-edge rows (no inset margins)
+        tv.intercellSpacing = NSSize(width: 0, height: 0)
         tv.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         let col = NSTableColumn(identifier: .init("email"))
         col.minWidth      = 240
@@ -128,11 +130,22 @@ final class MailViewController: NSViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         buildLayout()
+        setupContextMenu()
         NotificationCenter.default.addObserver(self, selector: #selector(authChanged),
                                                name: .gmailAuthChanged, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(inboxDidUpdate),
                                                name: .inboxDidUpdate, object: nil)
         updateUI()
+    }
+
+    private func setupContextMenu() {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        menu.delegate = self
+        let delete = NSMenuItem(title: "Move to Trash", action: #selector(deleteClickedRow), keyEquivalent: "")
+        delete.target = self
+        menu.addItem(delete)
+        tableView.menu = menu
     }
 
     override func viewDidAppear() {
@@ -352,6 +365,15 @@ extension MailViewController: NSSearchFieldDelegate {
     }
 }
 
+// MARK: - Context menu
+
+extension MailViewController: NSMenuDelegate {
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        let valid = tableView.clickedRow >= 0 && tableView.clickedRow < emails.count
+        menu.items.forEach { $0.isEnabled = valid }
+    }
+}
+
 // MARK: - Table DataSource & Delegate
 
 extension MailViewController: NSTableViewDataSource, NSTableViewDelegate {
@@ -376,6 +398,43 @@ extension MailViewController: NSTableViewDataSource, NSTableViewDelegate {
         tableView.deselectAll(nil)
         markReadLocally(email)
         onSelectEmail?(email)
+    }
+
+    // MARK: - Delete (context menu)
+
+    @objc private func deleteClickedRow() {
+        let row = tableView.clickedRow
+        guard row >= 0, row < emails.count else { return }
+        deleteEmail(emails[row])
+    }
+
+    private func deleteEmail(_ email: Email) {
+        // Optimistic removal; restored if the trash request fails.
+        allEmails.removeAll { $0.id == email.id }
+        applyFilter()
+        Task {
+            do {
+                try await GmailFetcher.shared.trash(email.id)
+                NotificationCenter.default.post(name: .inboxDidUpdate, object: nil)
+            } catch {
+                self.setEmails(await GmailFetcher.shared.currentEmails())   // restore
+                self.handleDeleteError(error)
+            }
+        }
+    }
+
+    private func handleDeleteError(_ error: Error) {
+        let needsReauth = (error as? GmailFetcher.GmailError)?.requiresReauth == true
+        let alert = NSAlert()
+        alert.messageText = "Couldn't delete email"
+        alert.informativeText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        alert.alertStyle = .warning
+        if needsReauth { alert.addButton(withTitle: "Reconnect") }
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        if needsReauth, alert.runModal() == .alertFirstButtonReturn {
+            Task { try? await GmailAuthManager.shared.startOAuthFlow() }
+        }
     }
 
     /// Clears the unread state when an email is opened. Read-only scope means this
@@ -483,7 +542,7 @@ final class EmailCellView: NSView {
             snippetLabel.leadingAnchor.constraint(equalTo: avatar.trailingAnchor, constant: 10),
             snippetLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
 
-            separator.leadingAnchor.constraint(equalTo: avatar.trailingAnchor, constant: 10),
+            separator.leadingAnchor.constraint(equalTo: leadingAnchor),
             separator.trailingAnchor.constraint(equalTo: trailingAnchor),
             separator.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
@@ -492,7 +551,9 @@ final class EmailCellView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     func configure(with email: Email) {
-        avatar.configure(initials: email.initials, color: EmailCellView.avatarColor(for: email.senderEmail))
+        avatar.configure(email: email.senderEmail,
+                         initials: email.initials,
+                         color: EmailCellView.avatarColor(for: email.senderEmail))
         senderLabel.stringValue  = email.senderName
         dateLabel.stringValue    = email.relativeDate
         subjectLabel.stringValue = email.subject
@@ -517,33 +578,67 @@ final class EmailCellView: NSView {
 final class AvatarView: NSView {
 
     private let label = NSTextField(labelWithString: "")
+    private let imageView = NSImageView()
+    private var currentEmail: String?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         layer?.cornerRadius = 17
+        layer?.masksToBounds = true
 
         label.translatesAutoresizingMaskIntoConstraints = false
         label.font = .systemFont(ofSize: 13, weight: .semibold)
         label.textColor = .white
         label.alignment = .center
+
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.isHidden = true
+
         addSubview(label)
+        addSubview(imageView)
 
         NSLayoutConstraint.activate([
             widthAnchor.constraint(equalToConstant: 34),
             heightAnchor.constraint(equalToConstant: 34),
             label.centerXAnchor.constraint(equalTo: centerXAnchor),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            imageView.topAnchor.constraint(equalTo: topAnchor),
+            imageView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            imageView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            imageView.trailingAnchor.constraint(equalTo: trailingAnchor),
         ])
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func configure(initials: String, color: NSColor) {
+    /// Shows initials immediately, then swaps in a real avatar if one loads.
+    func configure(email: String, initials: String, color: NSColor) {
+        currentEmail = email
         label.stringValue = initials
+        label.isHidden = false
+        imageView.isHidden = true
+        imageView.image = nil
         effectiveAppearance.performAsCurrentDrawingAppearance {
             layer?.backgroundColor = color.cgColor
+        }
+
+        Task { [weak self] in
+            let data = await AvatarProvider.shared.avatarData(for: email)
+            guard let self, self.currentEmail == email,
+                  let data, let image = NSImage(data: data) else { return }
+            self.apply(image)
+        }
+    }
+
+    private func apply(_ image: NSImage) {
+        imageView.image = image
+        imageView.isHidden = false
+        label.isHidden = true
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = NSColor.white.cgColor
         }
     }
 }

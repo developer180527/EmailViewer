@@ -3,14 +3,15 @@ import WebKit
 
 final class EmailDetailViewController: NSViewController {
 
-    private let email:    Email
-    var onBack: (() -> Void)?
+    private let email: Email
+    var onBack:    (() -> Void)?
+    var onDeleted: (() -> Void)?
+
+    private var attachments: [EmailAttachment] = []
 
     private lazy var headerView: NSView = {
         let v = NSView()
         v.translatesAutoresizingMaskIntoConstraints = false
-        // No custom background — let the popover material show through so it
-        // stays consistent in both light and dark mode.
         return v
     }()
 
@@ -25,6 +26,19 @@ final class EmailDetailViewController: NSViewController {
         b.imagePosition    = .imageLeft
         b.font             = .systemFont(ofSize: 13)
         b.contentTintColor = .controlAccentColor
+        return b
+    }()
+
+    private lazy var trashButton: NSButton = {
+        let b = NSButton(image: NSImage(systemSymbolName: "trash", accessibilityDescription: "Delete")!,
+                         target: self, action: #selector(deleteEmail))
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.bezelStyle = .texturedRounded
+        b.isBordered = false
+        b.contentTintColor = .secondaryLabelColor
+        b.toolTip = "Move to Trash"
+        b.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+        b.isHidden = true
         return b
     }()
 
@@ -44,50 +58,16 @@ final class EmailDetailViewController: NSViewController {
 
     private lazy var webView: WKWebView = {
         let config = WKWebViewConfiguration()
-        // Don't persist cookies/storage from email content; treat each render as throwaway.
         config.websiteDataStore = .nonPersistent()
-        // Email bodies must not run scripts.
         config.defaultWebpagePreferences.allowsContentJavaScript = false
         config.suppressesIncrementalRendering = true
 
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.translatesAutoresizingMaskIntoConstraints = false
         wv.navigationDelegate = self
-        wv.setValue(false, forKey: "drawsBackground")  // transparent so our CSS bg shows
+        wv.setValue(false, forKey: "drawsBackground")
         return wv
     }()
-
-    private lazy var attachmentsStack: NSStackView = {
-        let s = NSStackView()
-        s.translatesAutoresizingMaskIntoConstraints = false
-        s.orientation = .horizontal
-        s.spacing = 6
-        return s
-    }()
-
-    private lazy var attachmentsBar: NSView = {
-        let v = NSView()
-        v.translatesAutoresizingMaskIntoConstraints = false
-        v.isHidden = true
-        v.addSubview(attachmentsStack)
-        NSLayoutConstraint.activate([
-            attachmentsStack.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 12),
-            attachmentsStack.trailingAnchor.constraint(lessThanOrEqualTo: v.trailingAnchor, constant: -12),
-            attachmentsStack.centerYAnchor.constraint(equalTo: v.centerYAnchor),
-        ])
-        return v
-    }()
-
-    private lazy var attachmentsBarDivider: NSBox = {
-        let b = NSBox()
-        b.translatesAutoresizingMaskIntoConstraints = false
-        b.boxType = .separator
-        b.isHidden = true
-        return b
-    }()
-
-    private var attachmentsHeight: NSLayoutConstraint!
-    private var attachments: [EmailAttachment] = []
 
     init(email: Email) {
         self.email = email
@@ -105,13 +85,10 @@ final class EmailDetailViewController: NSViewController {
 
         view.addSubview(headerView)
         headerView.addSubview(backButton)
+        headerView.addSubview(trashButton)
         headerView.addSubview(spinner)
         view.addSubview(divider)
-        view.addSubview(attachmentsBar)
-        view.addSubview(attachmentsBarDivider)
         view.addSubview(webView)
-
-        attachmentsHeight = attachmentsBar.heightAnchor.constraint(equalToConstant: 0)
 
         NSLayoutConstraint.activate([
             headerView.topAnchor.constraint(equalTo: view.topAnchor),
@@ -122,23 +99,19 @@ final class EmailDetailViewController: NSViewController {
             backButton.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
             backButton.leadingAnchor.constraint(equalTo: headerView.leadingAnchor, constant: 6),
 
+            trashButton.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
+            trashButton.trailingAnchor.constraint(equalTo: headerView.trailingAnchor, constant: -10),
+            trashButton.widthAnchor.constraint(equalToConstant: 28),
+            trashButton.heightAnchor.constraint(equalToConstant: 28),
+
             spinner.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
-            spinner.trailingAnchor.constraint(equalTo: headerView.trailingAnchor, constant: -12),
+            spinner.trailingAnchor.constraint(equalTo: headerView.trailingAnchor, constant: -14),
 
             divider.topAnchor.constraint(equalTo: headerView.bottomAnchor),
             divider.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             divider.trailingAnchor.constraint(equalTo: view.trailingAnchor),
 
-            attachmentsBar.topAnchor.constraint(equalTo: divider.bottomAnchor),
-            attachmentsBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            attachmentsBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            attachmentsHeight,
-
-            attachmentsBarDivider.topAnchor.constraint(equalTo: attachmentsBar.bottomAnchor),
-            attachmentsBarDivider.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            attachmentsBarDivider.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-
-            webView.topAnchor.constraint(equalTo: attachmentsBarDivider.bottomAnchor),
+            webView.topAnchor.constraint(equalTo: divider.bottomAnchor),
             webView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             webView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
@@ -150,14 +123,15 @@ final class EmailDetailViewController: NSViewController {
     private func loadEmail() {
         spinner.isHidden = false
         spinner.startAnimation(nil)
+        trashButton.isHidden = true
 
         Task {
             do {
                 let content = try await GmailFetcher.shared.content(for: email.id)
                 await MainActor.run {
+                    self.attachments = content.attachments
                     self.stopSpinner()
-                    self.showAttachments(content.attachments)
-                    self.webView.loadHTMLString(self.htmlDocument(for: content.body), baseURL: nil)
+                    self.webView.loadHTMLString(self.htmlDocument(for: content), baseURL: nil)
                 }
             } catch {
                 await MainActor.run {
@@ -168,42 +142,55 @@ final class EmailDetailViewController: NSViewController {
         }
     }
 
-    // MARK: - Attachments
-
-    private func showAttachments(_ attachments: [EmailAttachment]) {
-        self.attachments = attachments
-        attachmentsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        guard !attachments.isEmpty else {
-            attachmentsBar.isHidden = true
-            attachmentsBarDivider.isHidden = true
-            attachmentsHeight.constant = 0
-            return
-        }
-        for (index, att) in attachments.enumerated() {
-            let chip = NSButton(title: " \(att.filename)  ·  \(att.displaySize)",
-                                image: NSImage(systemSymbolName: "paperclip", accessibilityDescription: "Attachment") ?? NSImage(),
-                                target: self, action: #selector(downloadAttachment(_:)))
-            chip.imagePosition = .imageLeading
-            chip.bezelStyle = .rounded
-            chip.controlSize = .small
-            chip.font = .systemFont(ofSize: 11)
-            chip.tag = index
-            chip.toolTip = "Save \(att.filename)"
-            attachmentsStack.addArrangedSubview(chip)
-        }
-        attachmentsBar.isHidden = false
-        attachmentsBarDivider.isHidden = false
-        attachmentsHeight.constant = 38
+    private func stopSpinner() {
+        spinner.stopAnimation(nil)
+        spinner.isHidden = true
+        trashButton.isHidden = false
     }
 
-    @objc private func downloadAttachment(_ sender: NSButton) {
-        guard sender.tag < attachments.count else { return }
-        let att = attachments[sender.tag]
-        sender.isEnabled = false
+    @objc private func goBack() { onBack?() }
+
+    // MARK: - Delete (move to Trash)
+
+    @objc private func deleteEmail() {
+        trashButton.isEnabled = false
+        Task {
+            do {
+                try await GmailFetcher.shared.trash(email.id)
+                NotificationCenter.default.post(name: .inboxDidUpdate, object: nil)
+                await MainActor.run { (self.onDeleted ?? self.onBack)?() }
+            } catch {
+                await MainActor.run {
+                    self.trashButton.isEnabled = true
+                    self.presentDeleteError(error)
+                }
+            }
+        }
+    }
+
+    private func presentDeleteError(_ error: Error) {
+        let needsReauth = (error as? GmailFetcher.GmailError)?.requiresReauth == true
+        let alert = NSAlert()
+        alert.messageText = "Couldn't delete email"
+        alert.informativeText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        alert.alertStyle = .warning
+        if needsReauth { alert.addButton(withTitle: "Reconnect") }
+        alert.addButton(withTitle: "OK")
+
+        NSApp.activate(ignoringOtherApps: true)
+        if needsReauth, alert.runModal() == .alertFirstButtonReturn {
+            Task { try? await GmailAuthManager.shared.startOAuthFlow() }
+        }
+    }
+
+    // MARK: - Attachments (downloaded via an `attachment://download/<index>` link)
+
+    private func downloadAttachment(at index: Int) {
+        guard index >= 0, index < attachments.count else { return }
+        let att = attachments[index]
         Task {
             let data = await GmailFetcher.shared.attachmentData(emailID: email.id, attachmentId: att.id)
             await MainActor.run {
-                sender.isEnabled = true
                 guard let data else { return }
                 self.saveAttachment(data, suggestedName: att.filename)
             }
@@ -222,25 +209,28 @@ final class EmailDetailViewController: NSViewController {
         }
     }
 
-    private func stopSpinner() {
-        spinner.stopAnimation(nil)
-        spinner.isHidden = true
-    }
-
-    @objc private func goBack() { onBack?() }
-
     // MARK: - HTML rendering
 
-    private func htmlDocument(for body: EmailBody) -> String {
-        let content: String
-        if let html = body.html, !html.isEmpty {
-            content = html
-        } else if let text = body.plainText, !text.isEmpty {
-            content = "<pre class='plain'>\(text.htmlEscaped)</pre>"
+    private func htmlDocument(for content: EmailContent) -> String {
+        let bodyHTML: String
+        if let html = content.body.html, !html.isEmpty {
+            bodyHTML = html
+        } else if let text = content.body.plainText, !text.isEmpty {
+            bodyHTML = "<pre class='plain'>\(text.htmlEscaped)</pre>"
         } else {
-            content = "<p class='empty'>This message has no content.</p>"
+            bodyHTML = "<p class='empty'>This message has no content.</p>"
         }
-        return page(content: content)
+        return page(content: bodyHTML + attachmentsHTML(content.attachments))
+    }
+
+    private func attachmentsHTML(_ attachments: [EmailAttachment]) -> String {
+        guard !attachments.isEmpty else { return "" }
+        var section = "<div class='attachments'><div class='att-title'>Attachments</div>"
+        for (i, att) in attachments.enumerated() {
+            section += "<a class='att' href='attachment://download/\(i)'>"
+                     + "📎 \(att.filename.htmlEscaped) <span class='att-size'>· \(att.displaySize)</span></a>"
+        }
+        return section + "</div>"
     }
 
     private func errorDocument(for error: Error) -> String {
@@ -255,6 +245,7 @@ final class EmailDetailViewController: NSViewController {
         let sub    = isDark ? "#ffffff" : "#000000"
         let meta   = isDark ? "#999999" : "#666666"
         let border = isDark ? "#333333" : "#eeeeee"
+        let chip   = isDark ? "#2b2b2b" : "#f3f3f3"
 
         return """
         <!doctype html>
@@ -277,6 +268,13 @@ final class EmailDetailViewController: NSViewController {
           table    { max-width:100%; }
           pre      { white-space:pre-wrap; }
           a        { color:#0a84ff; }
+          .attachments { margin-top:22px; padding-top:14px; border-top:1px solid \(border); }
+          .att-title { font-size:10px; font-weight:700; color:\(meta);
+                       text-transform:uppercase; letter-spacing:0.05em; margin-bottom:8px; }
+          .att { display:inline-flex; align-items:center; background:\(chip); color:\(text);
+                 text-decoration:none; padding:7px 11px; border-radius:8px;
+                 border:1px solid \(border); margin:0 6px 6px 0; font-size:12px; }
+          .att-size { color:\(meta); margin-left:4px; }
         </style>
         </head>
         <body>
@@ -289,18 +287,27 @@ final class EmailDetailViewController: NSViewController {
     }
 }
 
-// MARK: - Navigation: open links externally, keep email content sandboxed
+// MARK: - Navigation: attachment downloads + external links
 
 extension EmailDetailViewController: WKNavigationDelegate {
     func webView(_ webView: WKWebView,
                  decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        // A clicked link should open in the user's browser, not navigate inside the popover.
-        if navigationAction.navigationType == .linkActivated,
-           let url = navigationAction.request.url {
-            NSWorkspace.shared.open(url)
-            decisionHandler(.cancel)
-            return
+        if let url = navigationAction.request.url {
+            // Our in-email attachment links: attachment://download/<index>
+            if url.scheme == "attachment" {
+                if let last = url.pathComponents.last, let index = Int(last) {
+                    downloadAttachment(at: index)
+                }
+                decisionHandler(.cancel)
+                return
+            }
+            // Real link clicks open in the browser, not inside the popover.
+            if navigationAction.navigationType == .linkActivated {
+                NSWorkspace.shared.open(url)
+                decisionHandler(.cancel)
+                return
+            }
         }
         decisionHandler(.allow)
     }

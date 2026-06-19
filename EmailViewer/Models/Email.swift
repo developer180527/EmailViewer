@@ -2,7 +2,7 @@ import Foundation
 
 /// The decoded content of a message body. HTML is preferred when present;
 /// `plainText` is the fallback used for plain messages or when rendering fails.
-struct EmailBody {
+struct EmailBody: Codable {
     let html:      String?
     let plainText: String?
 
@@ -10,7 +10,7 @@ struct EmailBody {
 }
 
 /// A downloadable file attachment on a message.
-struct EmailAttachment: Identifiable {
+struct EmailAttachment: Identifiable, Codable {
     let id:       String   // Gmail attachmentId
     let filename: String
     let mimeType: String
@@ -25,7 +25,7 @@ struct EmailAttachment: Identifiable {
 }
 
 /// A fully-loaded message: rendered body plus its attachments.
-struct EmailContent {
+struct EmailContent: Codable {
     let body:        EmailBody
     let attachments: [EmailAttachment]
 }
