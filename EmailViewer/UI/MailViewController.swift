@@ -73,11 +73,27 @@ final class MailViewController: NSViewController {
         return sv
     }()
 
+    private lazy var headerBackground: NSVisualEffectView = {
+        let v = NSVisualEffectView()
+        v.translatesAutoresizingMaskIntoConstraints = false
+        v.material = .headerView           // subtle toolbar depth above the list
+        v.blendingMode = .withinWindow
+        v.state = .followsWindowActiveState
+        return v
+    }()
+
+    private lazy var skeletonView: SkeletonView = {
+        let s = SkeletonView()
+        s.translatesAutoresizingMaskIntoConstraints = false
+        s.isHidden = true
+        return s
+    }()
+
     private lazy var tableView: NSTableView = {
-        let tv = NSTableView()
+        let tv = HoverTableView()
         tv.dataSource  = self
         tv.delegate    = self
-        tv.rowHeight   = 70
+        tv.rowHeight   = 72
         tv.headerView  = nil
         tv.backgroundColor = .clear
         tv.selectionHighlightStyle = .none
@@ -167,10 +183,16 @@ final class MailViewController: NSViewController {
     private func buildLayout() {
         scrollView.documentView = tableView
 
-        [searchField, refreshButton, spinner, filterBar, topDivider, scrollView, emptyStack].forEach(view.addSubview)
+        [headerBackground, searchField, refreshButton, spinner, filterBar, topDivider,
+         scrollView, skeletonView, emptyStack].forEach(view.addSubview)
 
         NSLayoutConstraint.activate([
-            searchField.topAnchor.constraint(equalTo: view.topAnchor, constant: 10),
+            headerBackground.topAnchor.constraint(equalTo: view.topAnchor),
+            headerBackground.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            headerBackground.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            headerBackground.bottomAnchor.constraint(equalTo: topDivider.bottomAnchor),
+
+            searchField.topAnchor.constraint(equalTo: view.topAnchor, constant: 12),
             searchField.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
             searchField.trailingAnchor.constraint(equalTo: refreshButton.leadingAnchor, constant: -8),
             searchField.heightAnchor.constraint(equalToConstant: 24),
@@ -183,11 +205,11 @@ final class MailViewController: NSViewController {
             spinner.centerYAnchor.constraint(equalTo: refreshButton.centerYAnchor),
             spinner.centerXAnchor.constraint(equalTo: refreshButton.centerXAnchor),
 
-            filterBar.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 9),
+            filterBar.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 11),
             filterBar.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
             filterBar.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -12),
 
-            topDivider.topAnchor.constraint(equalTo: filterBar.bottomAnchor, constant: 9),
+            topDivider.topAnchor.constraint(equalTo: filterBar.bottomAnchor, constant: 11),
             topDivider.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             topDivider.trailingAnchor.constraint(equalTo: view.trailingAnchor),
 
@@ -196,6 +218,11 @@ final class MailViewController: NSViewController {
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
+            skeletonView.topAnchor.constraint(equalTo: scrollView.topAnchor, constant: 4),
+            skeletonView.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
+            skeletonView.trailingAnchor.constraint(equalTo: scrollView.trailingAnchor),
+            skeletonView.bottomAnchor.constraint(lessThanOrEqualTo: scrollView.bottomAnchor),
+
             emptyStack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             emptyStack.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor),
             emptyStack.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 30),
@@ -203,11 +230,21 @@ final class MailViewController: NSViewController {
         ])
     }
 
+    // MARK: - Skeleton
+
+    private func updateSkeleton() {
+        let show = isLoading && allEmails.isEmpty && GmailAuthManager.shared.isAuthenticated()
+        guard show != !skeletonView.isHidden else { return }
+        skeletonView.isHidden = !show
+        if show { skeletonView.startAnimating() } else { skeletonView.stopAnimating() }
+    }
+
     // MARK: - Data & search
 
     private func setEmails(_ list: [Email]) {
         allEmails = list
         applyFilter()
+        updateSkeleton()
     }
 
     private func applyFilter() {
@@ -337,12 +374,16 @@ final class MailViewController: NSViewController {
 
     private func setLoading(_ on: Bool) {
         isLoading = on
-        if on {
+        updateSkeleton()
+        // The skeleton already signals the first load; only spin for refreshes
+        // when there's existing content on screen.
+        let spin = on && !allEmails.isEmpty
+        if spin {
             spinner.isHidden = false; spinner.startAnimation(nil)
             refreshButton.isHidden = true
         } else {
             spinner.stopAnimation(nil); spinner.isHidden = true
-            refreshButton.isHidden = !GmailAuthManager.shared.isAuthenticated()
+            refreshButton.isHidden = !GmailAuthManager.shared.isAuthenticated() || on
         }
         updateEmptyState()
     }
@@ -452,10 +493,60 @@ extension MailViewController: NSTableViewDataSource, NSTableViewDelegate {
     }
 }
 
-// MARK: - Row View
+// MARK: - Row View (hover highlight)
 
 final class MailRowView: NSTableRowView {
+    var isHovered = false {
+        didSet { if isHovered != oldValue { needsDisplay = true } }
+    }
     override var isEmphasized: Bool { get { false } set {} }
+
+    override func drawBackground(in dirtyRect: NSRect) {
+        super.drawBackground(in: dirtyRect)
+        guard isHovered else { return }
+        let rect = bounds.insetBy(dx: 7, dy: 3)
+        let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
+        NSColor.labelColor.withAlphaComponent(0.07).setFill()
+        path.fill()
+    }
+}
+
+/// NSTableView that tracks the mouse and highlights the hovered row.
+final class HoverTableView: NSTableView {
+    private var hoverRow = -1
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(
+            rect: .zero,
+            options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved],
+            owner: self, userInfo: nil))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        updateHover(to: row(at: convert(event.locationInWindow, from: nil)))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        updateHover(to: -1)
+    }
+
+    private func updateHover(to newRow: Int) {
+        guard newRow != hoverRow else { return }
+        setHover(hoverRow, false)   // clear previous (may be -1, handled below)
+        hoverRow = newRow
+        setHover(newRow, true)
+    }
+
+    /// `rowView(atRow:)` raises an exception for out-of-range indices (e.g. -1
+    /// when the cursor is below the last row), so bounds-check first.
+    private func setHover(_ row: Int, _ hovered: Bool) {
+        guard row >= 0, row < numberOfRows else { return }
+        (rowView(atRow: row, makeIfNecessary: false) as? MailRowView)?.isHovered = hovered
+    }
 }
 
 // MARK: - Cell
@@ -464,6 +555,7 @@ final class EmailCellView: NSView {
 
     private let avatar = AvatarView()
 
+    // Accent dot in the left gutter for unread messages.
     private let unreadDot: NSView = {
         let v = NSView()
         v.translatesAutoresizingMaskIntoConstraints = false
@@ -483,12 +575,23 @@ final class EmailCellView: NSView {
         return iv
     }()
 
-    private let senderLabel  = EmailCellView.label(size: 12.5, bold: true)
+    private let attachClip: NSImageView = {
+        let iv = NSImageView()
+        iv.translatesAutoresizingMaskIntoConstraints = false
+        iv.image = NSImage(systemSymbolName: "paperclip", accessibilityDescription: "Has attachment")
+        iv.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 10, weight: .regular)
+        iv.contentTintColor = .secondaryLabelColor
+        iv.isHidden = true
+        return iv
+    }()
+
+    private let senderLabel  = EmailCellView.label(size: 13,   bold: true)
     private let dateLabel    = EmailCellView.label(size: 11,   color: .secondaryLabelColor)
     private let subjectLabel = EmailCellView.label(size: 12)
-    private let snippetLabel = EmailCellView.label(size: 11.5, color: .secondaryLabelColor)
+    private let snippetLabel = EmailCellView.label(size: 11.5, color: .tertiaryLabelColor)
 
     private var starWidth: NSLayoutConstraint!
+    private var attachWidth: NSLayoutConstraint!
 
     private let separator: NSBox = {
         let b = NSBox()
@@ -508,31 +611,37 @@ final class EmailCellView: NSView {
 
     override init(frame: NSRect) {
         super.init(frame: frame)
-        [avatar, unreadDot, senderLabel, starIcon, dateLabel, subjectLabel, snippetLabel, separator]
+        [avatar, unreadDot, senderLabel, starIcon, attachClip, dateLabel, subjectLabel, snippetLabel, separator]
             .forEach { addSubview($0) }
         dateLabel.alignment = .right
-        starWidth = starIcon.widthAnchor.constraint(equalToConstant: 0)
+        dateLabel.setContentHuggingPriority(.required, for: .horizontal)
+        dateLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        starWidth   = starIcon.widthAnchor.constraint(equalToConstant: 0)
+        attachWidth = attachClip.widthAnchor.constraint(equalToConstant: 0)
 
         NSLayoutConstraint.activate([
-            avatar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            avatar.centerYAnchor.constraint(equalTo: centerYAnchor),
-
             unreadDot.widthAnchor.constraint(equalToConstant: 7),
             unreadDot.heightAnchor.constraint(equalToConstant: 7),
-            unreadDot.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            unreadDot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
             unreadDot.centerYAnchor.constraint(equalTo: centerYAnchor),
 
-            senderLabel.topAnchor.constraint(equalTo: topAnchor, constant: 12),
+            avatar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 17),
+            avatar.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            senderLabel.topAnchor.constraint(equalTo: topAnchor, constant: 13),
             senderLabel.leadingAnchor.constraint(equalTo: avatar.trailingAnchor, constant: 10),
             senderLabel.trailingAnchor.constraint(equalTo: starIcon.leadingAnchor, constant: -4),
 
             starWidth,
             starIcon.centerYAnchor.constraint(equalTo: senderLabel.centerYAnchor),
-            starIcon.trailingAnchor.constraint(equalTo: dateLabel.leadingAnchor, constant: -4),
+            starIcon.trailingAnchor.constraint(equalTo: attachClip.leadingAnchor, constant: -4),
+
+            attachWidth,
+            attachClip.centerYAnchor.constraint(equalTo: dateLabel.centerYAnchor),
+            attachClip.trailingAnchor.constraint(equalTo: dateLabel.leadingAnchor, constant: -3),
 
             dateLabel.centerYAnchor.constraint(equalTo: senderLabel.centerYAnchor),
-            dateLabel.trailingAnchor.constraint(equalTo: unreadDot.leadingAnchor, constant: -8),
-            dateLabel.widthAnchor.constraint(equalToConstant: 58),
+            dateLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
 
             subjectLabel.topAnchor.constraint(equalTo: senderLabel.bottomAnchor, constant: 3),
             subjectLabel.leadingAnchor.constraint(equalTo: avatar.trailingAnchor, constant: 10),
@@ -555,18 +664,31 @@ final class EmailCellView: NSView {
                          initials: email.initials,
                          color: EmailCellView.avatarColor(for: email.senderEmail))
         senderLabel.stringValue  = email.senderName
-        dateLabel.stringValue    = email.relativeDate
+        // Bullet sits between the attachment paperclip and the time: "📎 • 5h ago".
+        dateLabel.stringValue    = email.hasAttachments ? "• \(email.relativeDate)" : email.relativeDate
         subjectLabel.stringValue = email.subject
         snippetLabel.stringValue = email.snippet
-        senderLabel.font = email.isRead ? .systemFont(ofSize: 12.5) : .boldSystemFont(ofSize: 12.5)
-        unreadDot.isHidden = email.isRead
-        starIcon.isHidden  = !email.isStarred
-        starWidth.constant = email.isStarred ? 11 : 0
+        senderLabel.font = email.isRead ? .systemFont(ofSize: 13, weight: .medium)
+                                        : .boldSystemFont(ofSize: 13)
+        unreadDot.isHidden  = email.isRead
+        starIcon.isHidden   = !email.isStarred
+        starWidth.constant  = email.isStarred ? 11 : 0
+        attachClip.isHidden  = !email.hasAttachments
+        attachWidth.constant = email.hasAttachments ? 13 : 0
     }
 
     private static func avatarColor(for seed: String) -> NSColor {
-        let palette: [NSColor] = [.systemBlue, .systemGreen, .systemIndigo, .systemOrange,
-                                  .systemPink, .systemPurple, .systemTeal, .systemRed]
+        // Curated, slightly-muted palette (white initials read well on all of them).
+        let palette: [NSColor] = [
+            NSColor(srgbRed: 0.31, green: 0.47, blue: 0.66, alpha: 1),  // blue
+            NSColor(srgbRed: 0.35, green: 0.63, blue: 0.39, alpha: 1),  // green
+            NSColor(srgbRed: 0.88, green: 0.41, blue: 0.38, alpha: 1),  // coral
+            NSColor(srgbRed: 0.61, green: 0.47, blue: 0.71, alpha: 1),  // purple
+            NSColor(srgbRed: 0.91, green: 0.59, blue: 0.27, alpha: 1),  // amber
+            NSColor(srgbRed: 0.30, green: 0.62, blue: 0.62, alpha: 1),  // teal
+            NSColor(srgbRed: 0.62, green: 0.46, blue: 0.38, alpha: 1),  // brown
+            NSColor(srgbRed: 0.78, green: 0.40, blue: 0.55, alpha: 1),  // pink
+        ]
         // Deterministic (process-stable) hash so a sender keeps the same color.
         let h = seed.unicodeScalars.reduce(5381) { ($0 &* 33) &+ Int($1.value) }
         return palette[abs(h) % palette.count]

@@ -89,10 +89,10 @@ final class RootViewController: NSViewController {
         let detail = EmailDetailViewController(email: email)
         detail.onBack    = { [weak self] in self?.popToList() }
         detail.onDeleted = { [weak self] in self?.popToList() }   // email already removed + list refreshed
-        show(detail)
+        show(detail, direction: .forward)
     }
 
-    func popToList() { show(listVC) }
+    func popToList() { show(listVC, direction: .back) }
 
     func handleSignInCompleted() {
         popToList()
@@ -100,16 +100,44 @@ final class RootViewController: NSViewController {
         listVC.loadEmails(forceRefresh: true)
     }
 
-    private func show(_ child: NSViewController) {
+    private enum Direction { case none, forward, back }
+
+    private func show(_ child: NSViewController, direction: Direction = .none) {
         guard currentChild !== child else { return }
-        currentChild?.view.removeFromSuperview()
-        currentChild?.removeFromParent()
+        let outgoing = currentChild
 
         addChild(child)
         child.view.frame = contentContainer.bounds
         child.view.autoresizingMask = [.width, .height]
         contentContainer.addSubview(child.view)
         currentChild = child
+
+        guard direction != .none, let outgoing else {
+            outgoing?.view.removeFromSuperview()
+            outgoing?.removeFromParent()
+            return
+        }
+
+        // Subtle slide + cross-fade so opening/closing an email feels like navigation.
+        child.view.wantsLayer = true
+        outgoing.view.wantsLayer = true
+        let dx: CGFloat = direction == .forward ? 26 : -26
+        child.view.alphaValue = 0
+        child.view.frame = contentContainer.bounds.offsetBy(dx: dx, dy: 0)
+
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.20
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            child.view.animator().alphaValue = 1
+            child.view.animator().frame = contentContainer.bounds
+            outgoing.view.animator().alphaValue = 0
+            outgoing.view.animator().frame = contentContainer.bounds.offsetBy(dx: -dx, dy: 0)
+        }, completionHandler: {
+            outgoing.view.removeFromSuperview()
+            outgoing.removeFromParent()
+            outgoing.view.alphaValue = 1
+            outgoing.view.frame = self.contentContainer.bounds
+        })
     }
 
     // MARK: - Toolbar actions
