@@ -148,8 +148,13 @@ final class EmailDetailViewController: NSViewController {
             } catch {
                 await MainActor.run {
                     self.stopSpinner()
-                    let message = (error as? LocalizedError)?.errorDescription ?? "Could not load this email."
-                    self.installMessage(message)
+                    if (error as? URLError)?.isOffline == true {
+                        self.installMessage(symbol: "wifi.slash",
+                                            "You're offline.\nThis email hasn't been downloaded yet.")
+                    } else {
+                        let message = (error as? LocalizedError)?.errorDescription ?? "Could not load this email."
+                        self.installMessage(symbol: "exclamationmark.triangle", message)
+                    }
                 }
             }
         }
@@ -236,15 +241,30 @@ final class EmailDetailViewController: NSViewController {
         pin(webView, to: contentContainer)
     }
 
-    private func installMessage(_ text: String) {
+    private func installMessage(symbol: String? = nil, _ text: String) {
+        let stack = NSStackView()
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 12
+
+        if let symbol, let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
+            let iv = NSImageView()
+            iv.image = image
+            iv.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 26, weight: .regular)
+            iv.contentTintColor = .tertiaryLabelColor
+            stack.addArrangedSubview(iv)
+        }
         let label = wrapLabel(text, font: .systemFont(ofSize: 13), color: .secondaryLabelColor)
         label.alignment = .center
-        contentContainer.addSubview(label)
+        stack.addArrangedSubview(label)
+
+        contentContainer.addSubview(stack)
         NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: contentContainer.centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: contentContainer.centerYAnchor),
-            label.leadingAnchor.constraint(greaterThanOrEqualTo: contentContainer.leadingAnchor, constant: 24),
-            label.trailingAnchor.constraint(lessThanOrEqualTo: contentContainer.trailingAnchor, constant: -24),
+            stack.centerXAnchor.constraint(equalTo: contentContainer.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: contentContainer.centerYAnchor),
+            stack.leadingAnchor.constraint(greaterThanOrEqualTo: contentContainer.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: contentContainer.trailingAnchor, constant: -24),
         ])
     }
 

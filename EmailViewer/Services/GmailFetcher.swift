@@ -746,11 +746,23 @@ actor GmailFetcher {
 
 // MARK: - Helpers
 
-private extension URLError {
+extension URLError {
+    /// Brief blips worth a quick retry. "No network" states are NOT here — retrying
+    /// them immediately is futile and just delays the (offline) failure.
     nonisolated var isTransient: Bool {
         switch code {
-        case .timedOut, .networkConnectionLost, .notConnectedToInternet,
-             .cannotConnectToHost, .dnsLookupFailed, .cannotFindHost:
+        case .timedOut, .networkConnectionLost:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// The device has no usable network route at all.
+    nonisolated var isOffline: Bool {
+        switch code {
+        case .notConnectedToInternet, .dataNotAllowed,
+             .cannotFindHost, .dnsLookupFailed, .cannotConnectToHost:
             return true
         default:
             return false

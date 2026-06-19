@@ -347,8 +347,13 @@ final class MailViewController: NSViewController {
             GmailAuthManager.shared.signOut()        // posts .gmailAuthChanged → list clears
             showStatus("Your Gmail session expired.\nPlease reconnect.")
         } else if emails.isEmpty {
-            showStatus((error as? LocalizedError)?.errorDescription ?? "Couldn't load your inbox.")
+            if (error as? URLError)?.isOffline == true {
+                showStatus("You're offline.\nConnect to the internet to load your inbox.")
+            } else {
+                showStatus((error as? LocalizedError)?.errorDescription ?? "Couldn't load your inbox.")
+            }
         }
+        // If we already have cached emails on screen, keep showing them silently.
     }
 
     private func handleAuthError(_ error: Error) {
