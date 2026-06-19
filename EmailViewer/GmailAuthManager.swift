@@ -4,6 +4,8 @@ import CryptoKit
 extension Notification.Name {
     /// Posted (on the main thread) whenever sign-in or sign-out completes.
     static let gmailAuthChanged = Notification.Name("gmailAuthChanged")
+    /// Posted after a background sync changes the cached inbox.
+    static let inboxDidUpdate = Notification.Name("inboxDidUpdate")
 }
 
 // MARK: - Configuration (nonisolated: shared by the main-actor manager and the token actor)

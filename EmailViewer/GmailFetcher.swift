@@ -8,8 +8,11 @@ actor GmailFetcher {
     private init() {}
 
     private var cachedEmails: [Email] = []
-    private var bodyCache: [String: EmailBody] = [:]
+    private var contentCache: [String: EmailContent] = [:]
+    private var contentOrder: [String] = []           // FIFO eviction order
+    private let maxCachedBodies = 12                   // cap memory used by parsed bodies
     private var lastListFetch: Date?
+    private var lastHistoryId: String?     // baseline for incremental (delta) sync
     private var didHydrate = false
 
     private let baseURL = "https://gmail.googleapis.com/gmail/v1/users/me"
@@ -18,6 +21,11 @@ actor GmailFetcher {
     private let listPageSize   = 25
     private let maxConcurrency = 6     // cap parallel metadata requests
     private let maxInlineImages = 30
+    private let maxCachedEmails = 50   // cap the cache so deltas don't grow it forever
+
+    /// IDs we've already accounted for, so notifications fire once per message
+    /// regardless of whether a full fetch or a delta sync discovered it.
+    private var seenIDs: Set<String> = []
 
     // MARK: - Fetch list (metadata only, fast)
 
@@ -39,8 +47,133 @@ actor GmailFetcher {
 
         cachedEmails  = emails.sorted { $0.date > $1.date }
         lastListFetch = Date()
+        lastHistoryId = try? await fetchProfileHistoryId()   // baseline for future deltas
         saveToDisk()
         return cachedEmails
+    }
+
+    // MARK: - Incremental (delta) sync
+
+    /// Syncs the inbox (incrementally when possible) and returns the messages
+    /// that are genuinely new since we last looked — i.e. worth a notification.
+    func checkForNewMail() async throws -> [Email] {
+        hydrateIfNeeded()
+
+        if let baseline = lastHistoryId {
+            do {
+                let changes = try await fetchHistory(since: baseline)
+                await applyDelta(changes)
+            } catch let error as GmailError {
+                if case .http(404, _) = error {
+                    _ = try await fetchEmails(forceRefresh: true)   // history window expired
+                } else {
+                    throw error
+                }
+            }
+        } else {
+            _ = try await fetchEmails(forceRefresh: true)           // no baseline yet
+        }
+
+        // New = unread messages now in the cache that we hadn't seen before.
+        // The first sync just seeds `seenIDs` (so we don't notify the whole inbox).
+        let firstSync = seenIDs.isEmpty
+        let newMail   = firstSync ? [] : cachedEmails.filter { !$0.isRead && !seenIDs.contains($0.id) }
+        seenIDs = Set(cachedEmails.map(\.id))
+        saveToDisk()
+        return newMail.sorted { $0.date > $1.date }
+    }
+
+    /// Marks a message read in the local cache only (we hold read-only scope, so
+    /// this doesn't change Gmail — it just clears the unread state in the UI).
+    func markRead(_ id: String) {
+        guard let i = cachedEmails.firstIndex(where: { $0.id == id }), !cachedEmails[i].isRead else { return }
+        cachedEmails[i].isRead = true
+        saveToDisk()
+    }
+
+    /// Unread messages currently in the cache (drives the menu-bar dot).
+    func unreadCount() -> Int {
+        hydrateIfNeeded()
+        return cachedEmails.filter { !$0.isRead }.count
+    }
+
+    private func applyDelta(_ changes: HistoryChanges) async {
+        let knownIDs = Set(cachedEmails.map(\.id))
+        let toFetch  = changes.addedIDs.filter { !knownIDs.contains($0) }
+        let added    = await boundedMap(toFetch, maxConcurrent: maxConcurrency) { id in
+            try? await self.fetchMessageMetadata(id: id)
+        }
+
+        for i in cachedEmails.indices {
+            if changes.markedRead.contains(cachedEmails[i].id)   { cachedEmails[i].isRead = true }
+            if changes.markedUnread.contains(cachedEmails[i].id) { cachedEmails[i].isRead = false }
+        }
+        if !changes.removedIDs.isEmpty {
+            cachedEmails.removeAll { changes.removedIDs.contains($0.id) }
+        }
+        if !added.isEmpty {
+            cachedEmails.append(contentsOf: added)
+        }
+        cachedEmails.sort { $0.date > $1.date }
+        if cachedEmails.count > maxCachedEmails {
+            cachedEmails = Array(cachedEmails.prefix(maxCachedEmails))
+        }
+        lastHistoryId = changes.newHistoryId ?? lastHistoryId
+        lastListFetch = Date()
+        saveToDisk()
+    }
+
+    private struct HistoryChanges {
+        var addedIDs:     [String] = []
+        var removedIDs:   Set<String> = []
+        var markedRead:   Set<String> = []
+        var markedUnread: Set<String> = []
+        var newHistoryId: String?
+    }
+
+    private func fetchHistory(since startHistoryId: String) async throws -> HistoryChanges {
+        var changes = HistoryChanges()
+        var pageToken: String?
+
+        repeat {
+            var components = URLComponents(string: "\(baseURL)/history")!
+            components.queryItems = [
+                .init(name: "startHistoryId", value: startHistoryId),
+                .init(name: "labelId",        value: "INBOX"),
+                .init(name: "historyTypes",   value: "messageAdded"),
+                .init(name: "historyTypes",   value: "messageDeleted"),
+                .init(name: "historyTypes",   value: "labelAdded"),
+                .init(name: "historyTypes",   value: "labelRemoved"),
+            ]
+            if let pageToken { components.queryItems?.append(.init(name: "pageToken", value: pageToken)) }
+
+            let data     = try await authorizedData(url: components.url!)
+            let response = try JSONDecoder().decode(HistoryListResponse.self, from: data)
+            changes.newHistoryId = response.historyId
+
+            for record in response.history ?? [] {
+                for added in record.messagesAdded ?? [] where added.message.labelIds?.contains("INBOX") == true {
+                    changes.addedIDs.append(added.message.id)
+                }
+                for deleted in record.messagesDeleted ?? [] {
+                    changes.removedIDs.insert(deleted.message.id)
+                }
+                for change in record.labelsRemoved ?? [] where change.labelIds?.contains("UNREAD") == true {
+                    changes.markedRead.insert(change.message.id)
+                }
+                for change in record.labelsAdded ?? [] where change.labelIds?.contains("UNREAD") == true {
+                    changes.markedUnread.insert(change.message.id)
+                }
+            }
+            pageToken = response.nextPageToken
+        } while pageToken != nil
+
+        return changes
+    }
+
+    private func fetchProfileHistoryId() async throws -> String? {
+        let data = try await authorizedData(url: URL(string: "\(baseURL)/profile")!)
+        return try JSONDecoder().decode(ProfileResponse.self, from: data).historyId
     }
 
     /// Cached emails for instant display (in-memory, falling back to disk).
@@ -59,22 +192,56 @@ actor GmailFetcher {
 
     func clearCache() {
         cachedEmails  = []
-        bodyCache     = [:]
+        contentCache  = [:]
+        contentOrder  = []
         lastListFetch = nil
+        lastHistoryId = nil
+        seenIDs       = []
         didHydrate    = true   // don't re-read the just-deleted disk cache
         clearDisk()
     }
 
     // MARK: - Fetch full body for a single email
 
-    func body(for emailID: String) async throws -> EmailBody {
-        if let cached = bodyCache[emailID] { return cached }
+    func content(for emailID: String) async throws -> EmailContent {
+        if let cached = contentCache[emailID] { return cached }
+
         let url  = URL(string: "\(baseURL)/messages/\(emailID)?format=full")!
         let data = try await authorizedData(url: url)
         let msg  = try JSONDecoder().decode(FullMessage.self, from: data)
+
         let body = await buildBody(from: msg, emailID: emailID)
-        bodyCache[emailID] = body
-        return body
+        var attachments: [EmailAttachment] = []
+        collectAttachments(msg.payload, into: &attachments)
+
+        let content = EmailContent(body: body, attachments: attachments)
+        contentCache[emailID] = content
+        contentOrder.append(emailID)
+        if contentOrder.count > maxCachedBodies {
+            let evict = contentOrder.removeFirst()
+            contentCache[evict] = nil
+        }
+        return content
+    }
+
+    /// Downloads a single attachment's bytes (used when the user saves it).
+    func attachmentData(emailID: String, attachmentId: String) async -> Data? {
+        await fetchAttachment(emailID: emailID, attachmentId: attachmentId)
+    }
+
+    private func collectAttachments(_ payload: FullMessage.Payload, into list: inout [EmailAttachment]) {
+        if let filename = payload.filename, !filename.isEmpty,
+           let attachmentId = payload.body?.attachmentId {
+            list.append(EmailAttachment(
+                id:       attachmentId,
+                filename: filename,
+                mimeType: payload.mimeType ?? "application/octet-stream",
+                size:     payload.body?.size ?? 0
+            ))
+        }
+        for part in payload.parts ?? [] {
+            collectAttachments(part, into: &list)
+        }
     }
 
     // MARK: - List / metadata
@@ -97,19 +264,25 @@ actor GmailFetcher {
             .init(name: "metadataHeaders", value: "Subject"),
             .init(name: "metadataHeaders", value: "From"),
             .init(name: "metadataHeaders", value: "Date"),
+            .init(name: "metadataHeaders", value: "Content-Type"),
         ]
         let data    = try await authorizedData(url: components.url!)
         let msg     = try JSONDecoder().decode(MessageDetail.self, from: data)
         let headers = msg.payload.headers
-        let isRead  = !msg.labelIds.contains("UNREAD")
+
+        // Heuristic from the top-level Content-Type: a multipart/mixed message
+        // carries file attachments (alternative/related do not).
+        let contentType = header("Content-Type", in: headers)?.lowercased() ?? ""
 
         return Email(
-            id:      msg.id,
-            subject: header("Subject", in: headers) ?? "(no subject)",
-            sender:  header("From",    in: headers) ?? "Unknown",
-            snippet: msg.snippet.htmlUnescaped,
-            date:    parseDate(header("Date", in: headers) ?? "") ?? Date(),
-            isRead:  isRead
+            id:             msg.id,
+            subject:        header("Subject", in: headers) ?? "(no subject)",
+            sender:         header("From",    in: headers) ?? "Unknown",
+            snippet:        msg.snippet.htmlUnescaped,
+            date:           parseDate(header("Date", in: headers) ?? "") ?? Date(),
+            isRead:         !msg.labelIds.contains("UNREAD"),
+            isStarred:      msg.labelIds.contains("STARRED"),
+            hasAttachments: contentType.contains("multipart/mixed")
         )
     }
 
@@ -120,8 +293,10 @@ actor GmailFetcher {
     // MARK: - Disk cache (survives app relaunch)
 
     private struct DiskPayload: Codable {
-        let emails:  [Email]
-        let savedAt: Date
+        let emails:    [Email]
+        let savedAt:   Date
+        var historyId: String?
+        var seenIDs:   [String]?
     }
 
     private func hydrateIfNeeded() {
@@ -133,11 +308,14 @@ actor GmailFetcher {
         else { return }
         cachedEmails  = payload.emails
         lastListFetch = payload.savedAt
+        lastHistoryId = payload.historyId
+        seenIDs       = Set(payload.seenIDs ?? [])
     }
 
     private func saveToDisk() {
         guard let url = diskURL() else { return }
-        let payload = DiskPayload(emails: cachedEmails, savedAt: lastListFetch ?? Date())
+        let payload = DiskPayload(emails: cachedEmails, savedAt: lastListFetch ?? Date(),
+                                  historyId: lastHistoryId, seenIDs: Array(seenIDs))
         guard let data = try? JSONEncoder().encode(payload) else { return }
         try? data.write(to: url, options: .atomic)
     }
@@ -425,11 +603,30 @@ actor GmailFetcher {
         struct Header: Decodable { let name: String; let value: String }
     }
 
+    private struct ProfileResponse: Decodable { let historyId: String? }
+
+    private struct HistoryListResponse: Decodable {
+        let history:       [Record]?
+        let historyId:     String?
+        let nextPageToken: String?
+
+        struct Record: Decodable {
+            let messagesAdded:   [MessageEvent]?
+            let messagesDeleted: [MessageEvent]?
+            let labelsAdded:     [LabelEvent]?
+            let labelsRemoved:   [LabelEvent]?
+        }
+        struct MessageEvent: Decodable { let message: HistoryMessage }
+        struct LabelEvent: Decodable { let message: HistoryMessage; let labelIds: [String]? }
+        struct HistoryMessage: Decodable { let id: String; let labelIds: [String]? }
+    }
+
     struct FullMessage: Decodable {
         let snippet: String
         let payload: Payload
         struct Payload: Decodable {
             let mimeType: String?
+            let filename: String?
             let headers:  [Header]?
             let body:     Body?
             let parts:    [Payload]?
@@ -442,6 +639,7 @@ actor GmailFetcher {
         struct Body: Decodable {
             let data:         String?
             let attachmentId: String?
+            let size:         Int?
         }
     }
 

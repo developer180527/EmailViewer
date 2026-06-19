@@ -9,6 +9,7 @@ final class MailViewController: NSViewController {
     private var allEmails: [Email] = []     // full inbox
     private var emails:    [Email] = []     // filtered/displayed
     private var searchQuery = ""
+    private var currentFilter: InboxFilter = .all
     private var isLoading = false
 
     // MARK: - Views
@@ -42,6 +43,15 @@ final class MailViewController: NSViewController {
         p.translatesAutoresizingMaskIntoConstraints = false
         p.style = .spinning; p.controlSize = .small; p.isHidden = true
         return p
+    }()
+
+    private lazy var filterBar: FilterBar = {
+        let bar = FilterBar()
+        bar.onChange = { [weak self] filter in
+            self?.currentFilter = filter
+            self?.applyFilter()
+        }
+        return bar
     }()
 
     private lazy var topDivider: NSBox = {
@@ -120,6 +130,8 @@ final class MailViewController: NSViewController {
         buildLayout()
         NotificationCenter.default.addObserver(self, selector: #selector(authChanged),
                                                name: .gmailAuthChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(inboxDidUpdate),
+                                               name: .inboxDidUpdate, object: nil)
         updateUI()
     }
 
@@ -142,7 +154,7 @@ final class MailViewController: NSViewController {
     private func buildLayout() {
         scrollView.documentView = tableView
 
-        [searchField, refreshButton, spinner, topDivider, scrollView, emptyStack].forEach(view.addSubview)
+        [searchField, refreshButton, spinner, filterBar, topDivider, scrollView, emptyStack].forEach(view.addSubview)
 
         NSLayoutConstraint.activate([
             searchField.topAnchor.constraint(equalTo: view.topAnchor, constant: 10),
@@ -158,7 +170,11 @@ final class MailViewController: NSViewController {
             spinner.centerYAnchor.constraint(equalTo: refreshButton.centerYAnchor),
             spinner.centerXAnchor.constraint(equalTo: refreshButton.centerXAnchor),
 
-            topDivider.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 10),
+            filterBar.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 9),
+            filterBar.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+            filterBar.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -12),
+
+            topDivider.topAnchor.constraint(equalTo: filterBar.bottomAnchor, constant: 9),
             topDivider.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             topDivider.trailingAnchor.constraint(equalTo: view.trailingAnchor),
 
@@ -182,11 +198,12 @@ final class MailViewController: NSViewController {
     }
 
     private func applyFilter() {
+        let base = allEmails.filter(currentFilter.matches)
         let query = searchQuery.trimmingCharacters(in: .whitespaces)
         if query.isEmpty {
-            emails = allEmails
+            emails = base
         } else {
-            emails = allEmails
+            emails = base
                 .compactMap { email -> (Email, Int)? in
                     guard let score = FuzzySearch.bestScore(
                         query: query,
@@ -215,7 +232,11 @@ final class MailViewController: NSViewController {
         } else if !searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
             showStatus("No matches for “\(searchQuery)”.")
         } else {
-            showStatus("No emails")
+            switch currentFilter {
+            case .all:     showStatus("No emails")
+            case .unread:  showStatus("No unread email")
+            case .starred: showStatus("No starred email")
+            }
         }
     }
 
@@ -239,6 +260,12 @@ final class MailViewController: NSViewController {
             Task { await GmailFetcher.shared.clearCache() }
             setEmails([])
         }
+    }
+
+    /// A background sync updated the cache — refresh the visible list silently.
+    @objc private func inboxDidUpdate() {
+        guard GmailAuthManager.shared.isAuthenticated() else { return }
+        Task { self.setEmails(await GmailFetcher.shared.currentEmails()) }
     }
 
     @objc private func refresh() { loadEmails(forceRefresh: true) }
@@ -310,6 +337,7 @@ final class MailViewController: NSViewController {
     func updateUI() {
         let authed = GmailAuthManager.shared.isAuthenticated()
         searchField.isHidden   = !authed
+        filterBar.isHidden     = !authed
         refreshButton.isHidden = !authed || isLoading
         updateEmptyState()
     }
@@ -346,7 +374,22 @@ extension MailViewController: NSTableViewDataSource, NSTableViewDelegate {
         guard row >= 0, row < emails.count else { return }
         let email = emails[row]
         tableView.deselectAll(nil)
+        markReadLocally(email)
         onSelectEmail?(email)
+    }
+
+    /// Clears the unread state when an email is opened. Read-only scope means this
+    /// is local-only (it doesn't mark the message read in Gmail).
+    private func markReadLocally(_ email: Email) {
+        guard !email.isRead else { return }
+        if let i = allEmails.firstIndex(where: { $0.id == email.id }) {
+            allEmails[i].isRead = true
+        }
+        applyFilter()
+        Task {
+            await GmailFetcher.shared.markRead(email.id)
+            NotificationCenter.default.post(name: .inboxDidUpdate, object: nil)   // updates badge
+        }
     }
 }
 
@@ -360,19 +403,33 @@ final class MailRowView: NSTableRowView {
 
 final class EmailCellView: NSView {
 
+    private let avatar = AvatarView()
+
     private let unreadDot: NSView = {
         let v = NSView()
         v.translatesAutoresizingMaskIntoConstraints = false
         v.wantsLayer = true
-        v.layer?.cornerRadius = 4
+        v.layer?.cornerRadius = 3.5
         v.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
         return v
+    }()
+
+    private let starIcon: NSImageView = {
+        let iv = NSImageView()
+        iv.translatesAutoresizingMaskIntoConstraints = false
+        iv.image = NSImage(systemSymbolName: "star.fill", accessibilityDescription: "Starred")
+        iv.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 9, weight: .regular)
+        iv.contentTintColor = .systemYellow
+        iv.isHidden = true
+        return iv
     }()
 
     private let senderLabel  = EmailCellView.label(size: 12.5, bold: true)
     private let dateLabel    = EmailCellView.label(size: 11,   color: .secondaryLabelColor)
     private let subjectLabel = EmailCellView.label(size: 12)
     private let snippetLabel = EmailCellView.label(size: 11.5, color: .secondaryLabelColor)
+
+    private var starWidth: NSLayoutConstraint!
 
     private let separator: NSBox = {
         let b = NSBox()
@@ -392,32 +449,41 @@ final class EmailCellView: NSView {
 
     override init(frame: NSRect) {
         super.init(frame: frame)
-        [unreadDot, senderLabel, dateLabel, subjectLabel, snippetLabel, separator].forEach { addSubview($0) }
+        [avatar, unreadDot, senderLabel, starIcon, dateLabel, subjectLabel, snippetLabel, separator]
+            .forEach { addSubview($0) }
         dateLabel.alignment = .right
+        starWidth = starIcon.widthAnchor.constraint(equalToConstant: 0)
 
         NSLayoutConstraint.activate([
-            unreadDot.widthAnchor.constraint(equalToConstant: 8),
-            unreadDot.heightAnchor.constraint(equalToConstant: 8),
-            unreadDot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
-            unreadDot.centerYAnchor.constraint(equalTo: senderLabel.centerYAnchor),
+            avatar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            avatar.centerYAnchor.constraint(equalTo: centerYAnchor),
 
-            senderLabel.topAnchor.constraint(equalTo: topAnchor, constant: 10),
-            senderLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
-            senderLabel.trailingAnchor.constraint(equalTo: dateLabel.leadingAnchor, constant: -8),
+            unreadDot.widthAnchor.constraint(equalToConstant: 7),
+            unreadDot.heightAnchor.constraint(equalToConstant: 7),
+            unreadDot.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            unreadDot.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            senderLabel.topAnchor.constraint(equalTo: topAnchor, constant: 12),
+            senderLabel.leadingAnchor.constraint(equalTo: avatar.trailingAnchor, constant: 10),
+            senderLabel.trailingAnchor.constraint(equalTo: starIcon.leadingAnchor, constant: -4),
+
+            starWidth,
+            starIcon.centerYAnchor.constraint(equalTo: senderLabel.centerYAnchor),
+            starIcon.trailingAnchor.constraint(equalTo: dateLabel.leadingAnchor, constant: -4),
 
             dateLabel.centerYAnchor.constraint(equalTo: senderLabel.centerYAnchor),
-            dateLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            dateLabel.widthAnchor.constraint(equalToConstant: 70),
+            dateLabel.trailingAnchor.constraint(equalTo: unreadDot.leadingAnchor, constant: -8),
+            dateLabel.widthAnchor.constraint(equalToConstant: 58),
 
             subjectLabel.topAnchor.constraint(equalTo: senderLabel.bottomAnchor, constant: 3),
-            subjectLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
+            subjectLabel.leadingAnchor.constraint(equalTo: avatar.trailingAnchor, constant: 10),
             subjectLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
 
             snippetLabel.topAnchor.constraint(equalTo: subjectLabel.bottomAnchor, constant: 2),
-            snippetLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
+            snippetLabel.leadingAnchor.constraint(equalTo: avatar.trailingAnchor, constant: 10),
             snippetLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
 
-            separator.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
+            separator.leadingAnchor.constraint(equalTo: avatar.trailingAnchor, constant: 10),
             separator.trailingAnchor.constraint(equalTo: trailingAnchor),
             separator.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
@@ -426,11 +492,58 @@ final class EmailCellView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     func configure(with email: Email) {
+        avatar.configure(initials: email.initials, color: EmailCellView.avatarColor(for: email.senderEmail))
         senderLabel.stringValue  = email.senderName
         dateLabel.stringValue    = email.relativeDate
         subjectLabel.stringValue = email.subject
         snippetLabel.stringValue = email.snippet
         senderLabel.font = email.isRead ? .systemFont(ofSize: 12.5) : .boldSystemFont(ofSize: 12.5)
         unreadDot.isHidden = email.isRead
+        starIcon.isHidden  = !email.isStarred
+        starWidth.constant = email.isStarred ? 11 : 0
+    }
+
+    private static func avatarColor(for seed: String) -> NSColor {
+        let palette: [NSColor] = [.systemBlue, .systemGreen, .systemIndigo, .systemOrange,
+                                  .systemPink, .systemPurple, .systemTeal, .systemRed]
+        // Deterministic (process-stable) hash so a sender keeps the same color.
+        let h = seed.unicodeScalars.reduce(5381) { ($0 &* 33) &+ Int($1.value) }
+        return palette[abs(h) % palette.count]
+    }
+}
+
+// MARK: - Avatar
+
+final class AvatarView: NSView {
+
+    private let label = NSTextField(labelWithString: "")
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 17
+
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .systemFont(ofSize: 13, weight: .semibold)
+        label.textColor = .white
+        label.alignment = .center
+        addSubview(label)
+
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 34),
+            heightAnchor.constraint(equalToConstant: 34),
+            label.centerXAnchor.constraint(equalTo: centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func configure(initials: String, color: NSColor) {
+        label.stringValue = initials
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = color.cgColor
+        }
     }
 }

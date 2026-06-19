@@ -57,6 +57,38 @@ final class EmailDetailViewController: NSViewController {
         return wv
     }()
 
+    private lazy var attachmentsStack: NSStackView = {
+        let s = NSStackView()
+        s.translatesAutoresizingMaskIntoConstraints = false
+        s.orientation = .horizontal
+        s.spacing = 6
+        return s
+    }()
+
+    private lazy var attachmentsBar: NSView = {
+        let v = NSView()
+        v.translatesAutoresizingMaskIntoConstraints = false
+        v.isHidden = true
+        v.addSubview(attachmentsStack)
+        NSLayoutConstraint.activate([
+            attachmentsStack.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 12),
+            attachmentsStack.trailingAnchor.constraint(lessThanOrEqualTo: v.trailingAnchor, constant: -12),
+            attachmentsStack.centerYAnchor.constraint(equalTo: v.centerYAnchor),
+        ])
+        return v
+    }()
+
+    private lazy var attachmentsBarDivider: NSBox = {
+        let b = NSBox()
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.boxType = .separator
+        b.isHidden = true
+        return b
+    }()
+
+    private var attachmentsHeight: NSLayoutConstraint!
+    private var attachments: [EmailAttachment] = []
+
     init(email: Email) {
         self.email = email
         super.init(nibName: nil, bundle: nil)
@@ -75,7 +107,11 @@ final class EmailDetailViewController: NSViewController {
         headerView.addSubview(backButton)
         headerView.addSubview(spinner)
         view.addSubview(divider)
+        view.addSubview(attachmentsBar)
+        view.addSubview(attachmentsBarDivider)
         view.addSubview(webView)
+
+        attachmentsHeight = attachmentsBar.heightAnchor.constraint(equalToConstant: 0)
 
         NSLayoutConstraint.activate([
             headerView.topAnchor.constraint(equalTo: view.topAnchor),
@@ -93,7 +129,16 @@ final class EmailDetailViewController: NSViewController {
             divider.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             divider.trailingAnchor.constraint(equalTo: view.trailingAnchor),
 
-            webView.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            attachmentsBar.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            attachmentsBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            attachmentsBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            attachmentsHeight,
+
+            attachmentsBarDivider.topAnchor.constraint(equalTo: attachmentsBar.bottomAnchor),
+            attachmentsBarDivider.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            attachmentsBarDivider.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+
+            webView.topAnchor.constraint(equalTo: attachmentsBarDivider.bottomAnchor),
             webView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             webView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
@@ -108,16 +153,71 @@ final class EmailDetailViewController: NSViewController {
 
         Task {
             do {
-                let body = try await GmailFetcher.shared.body(for: email.id)
+                let content = try await GmailFetcher.shared.content(for: email.id)
                 await MainActor.run {
                     self.stopSpinner()
-                    self.webView.loadHTMLString(self.htmlDocument(for: body), baseURL: nil)
+                    self.showAttachments(content.attachments)
+                    self.webView.loadHTMLString(self.htmlDocument(for: content.body), baseURL: nil)
                 }
             } catch {
                 await MainActor.run {
                     self.stopSpinner()
                     self.webView.loadHTMLString(self.errorDocument(for: error), baseURL: nil)
                 }
+            }
+        }
+    }
+
+    // MARK: - Attachments
+
+    private func showAttachments(_ attachments: [EmailAttachment]) {
+        self.attachments = attachments
+        attachmentsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        guard !attachments.isEmpty else {
+            attachmentsBar.isHidden = true
+            attachmentsBarDivider.isHidden = true
+            attachmentsHeight.constant = 0
+            return
+        }
+        for (index, att) in attachments.enumerated() {
+            let chip = NSButton(title: " \(att.filename)  ·  \(att.displaySize)",
+                                image: NSImage(systemSymbolName: "paperclip", accessibilityDescription: "Attachment") ?? NSImage(),
+                                target: self, action: #selector(downloadAttachment(_:)))
+            chip.imagePosition = .imageLeading
+            chip.bezelStyle = .rounded
+            chip.controlSize = .small
+            chip.font = .systemFont(ofSize: 11)
+            chip.tag = index
+            chip.toolTip = "Save \(att.filename)"
+            attachmentsStack.addArrangedSubview(chip)
+        }
+        attachmentsBar.isHidden = false
+        attachmentsBarDivider.isHidden = false
+        attachmentsHeight.constant = 38
+    }
+
+    @objc private func downloadAttachment(_ sender: NSButton) {
+        guard sender.tag < attachments.count else { return }
+        let att = attachments[sender.tag]
+        sender.isEnabled = false
+        Task {
+            let data = await GmailFetcher.shared.attachmentData(emailID: email.id, attachmentId: att.id)
+            await MainActor.run {
+                sender.isEnabled = true
+                guard let data else { return }
+                self.saveAttachment(data, suggestedName: att.filename)
+            }
+        }
+    }
+
+    private func saveAttachment(_ data: Data, suggestedName: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = suggestedName
+        panel.canCreateDirectories = true
+        panel.begin { response in
+            if response == .OK, let url = panel.url {
+                try? data.write(to: url)
             }
         }
     }

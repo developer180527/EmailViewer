@@ -21,6 +21,7 @@ final class SettingsWindowController: NSWindowController {
     static let shared = SettingsWindowController()
 
     private let launchSwitch  = NSSwitch()
+    private let notifySwitch   = NSSwitch()
     private let accountStatus = NSTextField(labelWithString: "")
     private let accountButton = NSButton(title: "", target: nil, action: nil)
 
@@ -66,6 +67,15 @@ final class SettingsWindowController: NSWindowController {
         launchHint.font = .systemFont(ofSize: 11)
         launchHint.textColor = .secondaryLabelColor
 
+        let notifyLabel = NSTextField(labelWithString: "New mail notifications")
+        notifyLabel.font = .systemFont(ofSize: 13)
+        notifySwitch.target = self
+        notifySwitch.action = #selector(toggleNotifications)
+
+        let notifyHint = NSTextField(labelWithString: "Show a banner when new email arrives.")
+        notifyHint.font = .systemFont(ofSize: 11)
+        notifyHint.textColor = .secondaryLabelColor
+
         let divider = NSBox(); divider.boxType = .separator
 
         let accountHeader = sectionHeader("ACCOUNT")
@@ -87,8 +97,13 @@ final class SettingsWindowController: NSWindowController {
         launchRow.orientation = .horizontal
         launchRow.alignment = .centerY
 
+        let notifyRow = NSStackView(views: [notifyLabel, NSView(), notifySwitch])
+        notifyRow.orientation = .horizontal
+        notifyRow.alignment = .centerY
+
         let stack = NSStackView(views: [
             generalHeader, launchRow, launchHint,
+            spacer(6), notifyRow, notifyHint,
             spacer(8), divider, spacer(8),
             accountHeader, accountRow,
             NSView(),
@@ -107,6 +122,7 @@ final class SettingsWindowController: NSWindowController {
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             launchRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -44),
+            notifyRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -44),
             accountRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -44),
             divider.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -44),
         ])
@@ -130,6 +146,7 @@ final class SettingsWindowController: NSWindowController {
 
     @objc private func refreshState() {
         launchSwitch.state = LoginItem.isEnabled ? .on : .off
+        notifySwitch.state = MailNotifier.isEnabled ? .on : .off
         let authed = GmailAuthManager.shared.isAuthenticated()
         accountStatus.stringValue = authed ? "Gmail connected" : "Not connected"
         accountStatus.textColor   = authed ? .labelColor : .secondaryLabelColor
@@ -151,6 +168,11 @@ final class SettingsWindowController: NSWindowController {
             alert.alertStyle = .warning
             alert.runModal()
         }
+    }
+
+    @objc private func toggleNotifications() {
+        MailNotifier.isEnabled = (notifySwitch.state == .on)
+        if MailNotifier.isEnabled { MailNotifier.requestAuthorization() }
     }
 
     @objc private func accountAction() {
