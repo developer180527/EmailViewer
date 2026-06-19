@@ -326,18 +326,45 @@ final class EmailDetailViewController: NSViewController {
 
     // MARK: - Attachments
 
-    private func attachmentChip(_ att: EmailAttachment, index: Int) -> NSButton {
-        let b = NSButton(title: " \(att.filename)  ·  \(att.displaySize)",
-                         image: NSImage(systemSymbolName: "paperclip", accessibilityDescription: "Attachment") ?? NSImage(),
-                         target: self, action: #selector(downloadAttachmentButton(_:)))
-        b.translatesAutoresizingMaskIntoConstraints = false
-        b.imagePosition = .imageLeading
-        b.bezelStyle = .rounded
-        b.controlSize = .small
-        b.font = .systemFont(ofSize: 11)
-        b.tag = index
-        b.toolTip = "Save \(att.filename)"
-        return b
+    /// Inert chip (paperclip + name) plus a dedicated download icon — only the
+    /// icon triggers the save; clicking the chip body does nothing.
+    private func attachmentChip(_ att: EmailAttachment, index: Int) -> NSView {
+        let clip = NSImageView()
+        clip.image = NSImage(systemSymbolName: "paperclip", accessibilityDescription: nil)
+        clip.symbolConfiguration = .init(pointSize: 11, weight: .regular)
+        clip.contentTintColor = .secondaryLabelColor
+        clip.setContentHuggingPriority(.required, for: .horizontal)
+
+        let label = NSTextField(labelWithString: "\(att.filename)  ·  \(att.displaySize)")
+        label.font = .systemFont(ofSize: 11)
+        label.textColor = .labelColor
+        label.lineBreakMode = .byTruncatingMiddle
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let download = NSButton(image: NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: "Download")!,
+                                target: self, action: #selector(downloadAttachmentButton(_:)))
+        download.translatesAutoresizingMaskIntoConstraints = false
+        download.isBordered = false
+        download.bezelStyle = .texturedRounded
+        download.contentTintColor = .controlAccentColor
+        download.symbolConfiguration = .init(pointSize: 14, weight: .regular)
+        download.tag = index
+        download.toolTip = "Download \(att.filename)"
+        download.setContentHuggingPriority(.required, for: .horizontal)
+
+        let stack = NSStackView(views: [clip, label, download])
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 7
+        stack.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 8)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.wantsLayer = true
+        stack.layer?.cornerRadius = 8
+        stack.layer?.borderWidth = 0.5
+        stack.effectiveAppearance.performAsCurrentDrawingAppearance {
+            stack.layer?.borderColor = NSColor.separatorColor.cgColor
+        }
+        return stack
     }
 
     @objc private func downloadAttachmentButton(_ sender: NSButton) {
@@ -399,8 +426,10 @@ final class EmailDetailViewController: NSViewController {
         guard !attachments.isEmpty else { return "" }
         var section = "<div class='attachments'><div class='att-title'>Attachments</div>"
         for (i, att) in attachments.enumerated() {
-            section += "<a class='att' href='attachment://download/\(i)'>"
-                     + "📎 \(att.filename.htmlEscaped) <span class='att-size'>· \(att.displaySize)</span></a>"
+            // The chip itself isn't a link; only the ↓ icon downloads.
+            section += "<span class='att'>📎 <span class='att-name'>\(att.filename.htmlEscaped)</span> "
+                     + "<span class='att-size'>· \(att.displaySize)</span>"
+                     + "<a class='att-dl' href='attachment://download/\(i)' title='Download'>&#8595;</a></span>"
         }
         return section + "</div>"
     }
@@ -437,9 +466,13 @@ final class EmailDetailViewController: NSViewController {
           .att-title { font-size:10px; font-weight:700; color:\(meta);
                        text-transform:uppercase; letter-spacing:0.05em; margin-bottom:8px; }
           .att { display:inline-flex; align-items:center; background:\(chip); color:\(text);
-                 text-decoration:none; padding:7px 11px; border-radius:8px;
+                 padding:6px 6px 6px 11px; border-radius:8px;
                  border:1px solid \(border); margin:0 6px 6px 0; font-size:12px; }
-          .att-size { color:\(meta); margin-left:4px; }
+          .att-size { color:\(meta); margin:0 4px; }
+          .att-dl { display:inline-flex; align-items:center; justify-content:center;
+                    width:22px; height:22px; border-radius:50%; text-decoration:none;
+                    color:#0a84ff; background:rgba(10,132,255,0.14);
+                    font-size:14px; font-weight:700; line-height:1; }
         </style>
         </head>
         <body>

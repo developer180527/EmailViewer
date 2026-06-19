@@ -8,6 +8,7 @@ actor GmailFetcher {
     private init() {}
 
     private var cachedEmails: [Email] = []
+    private var cachedEmailAddress: String?
     private var contentCache: [String: EmailContent] = [:]
     private var contentOrder: [String] = []           // FIFO eviction order
     private let maxCachedBodies = 12                   // cap memory used by parsed bodies
@@ -192,6 +193,7 @@ actor GmailFetcher {
 
     func clearCache() {
         cachedEmails  = []
+        cachedEmailAddress = nil
         contentCache  = [:]
         contentOrder  = []
         lastListFetch = nil
@@ -257,6 +259,17 @@ actor GmailFetcher {
         contentOrder.removeAll { $0 == emailID }
         deleteContentFromDisk(emailID)
         saveToDisk()
+    }
+
+    // MARK: - Account
+
+    /// The connected Gmail address (cached for the session).
+    func accountEmail() async -> String? {
+        if let cached = cachedEmailAddress { return cached }
+        guard let data = try? await authorizedData(url: URL(string: "\(baseURL)/profile")!),
+              let resp = try? JSONDecoder().decode(ProfileResponse.self, from: data) else { return nil }
+        cachedEmailAddress = resp.emailAddress
+        return resp.emailAddress
     }
 
     private func collectAttachments(_ payload: FullMessage.Payload, into list: inout [EmailAttachment]) {
@@ -688,7 +701,7 @@ actor GmailFetcher {
         struct Header: Decodable { let name: String; let value: String }
     }
 
-    private struct ProfileResponse: Decodable { let historyId: String? }
+    private struct ProfileResponse: Decodable { let historyId: String?; let emailAddress: String? }
 
     private struct HistoryListResponse: Decodable {
         let history:       [Record]?

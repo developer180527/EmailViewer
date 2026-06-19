@@ -148,9 +148,20 @@ final class SettingsWindowController: NSWindowController {
         launchSwitch.state = LoginItem.isEnabled ? .on : .off
         notifySwitch.state = MailNotifier.isEnabled ? .on : .off
         let authed = GmailAuthManager.shared.isAuthenticated()
-        accountStatus.stringValue = authed ? "Gmail connected" : "Not connected"
-        accountStatus.textColor   = authed ? .labelColor : .secondaryLabelColor
-        accountButton.title       = authed ? "Sign Out" : "Connect Gmail"
+        accountButton.title     = authed ? "Sign Out" : "Connect Gmail"
+        accountStatus.textColor = authed ? .labelColor : .secondaryLabelColor
+
+        if authed {
+            accountStatus.stringValue = "Gmail connected"
+            // Replace with the actual address once the profile resolves.
+            Task {
+                if let email = await GmailFetcher.shared.accountEmail() {
+                    self.accountStatus.stringValue = email
+                }
+            }
+        } else {
+            accountStatus.stringValue = "Not connected"
+        }
     }
 
     // MARK: - Actions
