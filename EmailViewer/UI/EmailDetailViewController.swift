@@ -13,7 +13,7 @@ final class EmailDetailViewController: NSViewController {
 
     private var attachments: [EmailAttachment] = []
     private var renderedHTML: (html: String, attachments: [EmailAttachment])?
-    private var showRemoteImages = false   // off by default — block trackers/remote images
+    private var showRemoteImages = !Preferences.blockRemoteImages   // honor the privacy setting
 
     private lazy var headerView: NSView = {
         let v = NSView()

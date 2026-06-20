@@ -22,12 +22,13 @@ final class SettingsWindowController: NSWindowController {
 
     private let launchSwitch  = NSSwitch()
     private let notifySwitch   = NSSwitch()
+    private let imagesSwitch   = NSSwitch()
     private let accountStatus = NSTextField(labelWithString: "")
     private let accountButton = NSButton(title: "", target: nil, action: nil)
 
     private init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 400, height: 250),
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 330),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -78,6 +79,18 @@ final class SettingsWindowController: NSWindowController {
 
         let divider = NSBox(); divider.boxType = .separator
 
+        let privacyHeader = sectionHeader("PRIVACY")
+        let imagesLabel = NSTextField(labelWithString: "Block remote images")
+        imagesLabel.font = .systemFont(ofSize: 13)
+        imagesSwitch.target = self
+        imagesSwitch.action = #selector(toggleBlockImages)
+
+        let imagesHint = NSTextField(labelWithString: "Stops senders from tracking when you open an email.")
+        imagesHint.font = .systemFont(ofSize: 11)
+        imagesHint.textColor = .secondaryLabelColor
+
+        let divider2 = NSBox(); divider2.boxType = .separator
+
         let accountHeader = sectionHeader("ACCOUNT")
         accountStatus.font = .systemFont(ofSize: 13)
         accountButton.bezelStyle = .rounded
@@ -101,10 +114,16 @@ final class SettingsWindowController: NSWindowController {
         notifyRow.orientation = .horizontal
         notifyRow.alignment = .centerY
 
+        let imagesRow = NSStackView(views: [imagesLabel, NSView(), imagesSwitch])
+        imagesRow.orientation = .horizontal
+        imagesRow.alignment = .centerY
+
         let stack = NSStackView(views: [
             generalHeader, launchRow, launchHint,
             spacer(6), notifyRow, notifyHint,
             spacer(8), divider, spacer(8),
+            privacyHeader, imagesRow, imagesHint,
+            spacer(8), divider2, spacer(8),
             accountHeader, accountRow,
             NSView(),
             version,
@@ -123,8 +142,10 @@ final class SettingsWindowController: NSWindowController {
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             launchRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -44),
             notifyRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -44),
+            imagesRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -44),
             accountRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -44),
             divider.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -44),
+            divider2.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -44),
         ])
     }
 
@@ -147,6 +168,7 @@ final class SettingsWindowController: NSWindowController {
     @objc private func refreshState() {
         launchSwitch.state = LoginItem.isEnabled ? .on : .off
         notifySwitch.state = MailNotifier.isEnabled ? .on : .off
+        imagesSwitch.state = Preferences.blockRemoteImages ? .on : .off
         let authed = GmailAuthManager.shared.isAuthenticated()
         accountButton.title     = authed ? "Sign Out" : "Connect Gmail"
         accountStatus.textColor = authed ? .labelColor : .secondaryLabelColor
@@ -184,6 +206,10 @@ final class SettingsWindowController: NSWindowController {
     @objc private func toggleNotifications() {
         MailNotifier.isEnabled = (notifySwitch.state == .on)
         if MailNotifier.isEnabled { MailNotifier.requestAuthorization() }
+    }
+
+    @objc private func toggleBlockImages() {
+        Preferences.blockRemoteImages = (imagesSwitch.state == .on)
     }
 
     @objc private func accountAction() {
