@@ -9,10 +9,11 @@ private final class FlippedView: NSView {
 final class EmailDetailViewController: NSViewController {
 
     private let email: Email
-    var onBack:    (() -> Void)?
-    var onDeleted: (() -> Void)?
+    var onBack: (() -> Void)?
 
     private var attachments: [EmailAttachment] = []
+    private var renderedHTML: (html: String, attachments: [EmailAttachment])?
+    private var showRemoteImages = false   // off by default — block trackers/remote images
 
     private lazy var headerView: NSView = {
         let v = NSView()
@@ -31,19 +32,6 @@ final class EmailDetailViewController: NSViewController {
         b.imagePosition    = .imageLeft
         b.font             = .systemFont(ofSize: 13)
         b.contentTintColor = .controlAccentColor
-        return b
-    }()
-
-    private lazy var trashButton: NSButton = {
-        let b = NSButton(image: NSImage(systemSymbolName: "trash", accessibilityDescription: "Delete")!,
-                         target: self, action: #selector(deleteEmail))
-        b.translatesAutoresizingMaskIntoConstraints = false
-        b.bezelStyle = .texturedRounded
-        b.isBordered = false
-        b.contentTintColor = .secondaryLabelColor
-        b.toolTip = "Move to Trash"
-        b.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
-        b.isHidden = true
         return b
     }()
 
@@ -97,7 +85,6 @@ final class EmailDetailViewController: NSViewController {
 
         view.addSubview(headerView)
         headerView.addSubview(backButton)
-        headerView.addSubview(trashButton)
         headerView.addSubview(spinner)
         view.addSubview(divider)
         view.addSubview(contentContainer)
@@ -110,11 +97,6 @@ final class EmailDetailViewController: NSViewController {
 
             backButton.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
             backButton.leadingAnchor.constraint(equalTo: headerView.leadingAnchor, constant: 6),
-
-            trashButton.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
-            trashButton.trailingAnchor.constraint(equalTo: headerView.trailingAnchor, constant: -10),
-            trashButton.widthAnchor.constraint(equalToConstant: 28),
-            trashButton.heightAnchor.constraint(equalToConstant: 28),
 
             spinner.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
             spinner.trailingAnchor.constraint(equalTo: headerView.trailingAnchor, constant: -14),
@@ -135,7 +117,6 @@ final class EmailDetailViewController: NSViewController {
     private func loadEmail() {
         spinner.isHidden = false
         spinner.startAnimation(nil)
-        trashButton.isHidden = true
 
         Task {
             do {
@@ -165,13 +146,19 @@ final class EmailDetailViewController: NSViewController {
     private func render(_ content: EmailContent) {
         if let html = content.body.html, !html.isEmpty, Self.isRichHTML(html) {
             installWebView()
-            webView.loadHTMLString(htmlDocument(html: html, attachments: content.attachments), baseURL: nil)
+            renderedHTML = (html, content.attachments)
+            reloadHTML()
         } else {
             let text = content.body.plainText
                 ?? content.body.html.map(Self.strippedText)
                 ?? "This message has no content."
             installPlainView(text: text, attachments: content.attachments)
         }
+    }
+
+    private func reloadHTML() {
+        guard let r = renderedHTML else { return }
+        webView.loadHTMLString(htmlDocument(html: r.html, attachments: r.attachments), baseURL: nil)
     }
 
     /// True only when the HTML carries real formatting/structure worth a WebView.
@@ -240,43 +227,12 @@ final class EmailDetailViewController: NSViewController {
     private func stopSpinner() {
         spinner.stopAnimation(nil)
         spinner.isHidden = true
-        trashButton.isHidden = false
     }
 
     @objc private func goBack() { onBack?() }
 
-    // MARK: - Delete (move to Trash)
-
-    @objc private func deleteEmail() {
-        trashButton.isEnabled = false
-        Task {
-            do {
-                try await GmailFetcher.shared.trash(email.id)
-                NotificationCenter.default.post(name: .inboxDidUpdate, object: nil)
-                await MainActor.run { (self.onDeleted ?? self.onBack)?() }
-            } catch {
-                await MainActor.run {
-                    self.trashButton.isEnabled = true
-                    self.presentDeleteError(error)
-                }
-            }
-        }
-    }
-
-    private func presentDeleteError(_ error: Error) {
-        let needsReauth = (error as? GmailFetcher.GmailError)?.requiresReauth == true
-        let alert = NSAlert()
-        alert.messageText = "Couldn't delete email"
-        alert.informativeText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-        alert.alertStyle = .warning
-        if needsReauth { alert.addButton(withTitle: "Reconnect") }
-        alert.addButton(withTitle: "OK")
-
-        NSApp.activate(ignoringOtherApps: true)
-        if needsReauth, alert.runModal() == .alertFirstButtonReturn {
-            Task { try? await GmailAuthManager.shared.startOAuthFlow() }
-        }
-    }
+    // Keyboard hooks driven by RootViewController's key monitor.
+    func goBackFromKeyboard() { onBack?() }
 
     // MARK: - Content installation
 
@@ -403,6 +359,23 @@ final class EmailDetailViewController: NSViewController {
         label.lineBreakMode = .byTruncatingMiddle
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        // Clicking the name/icon Quick Looks the attachment.
+        let previewArea = ClickableView()
+        previewArea.toolTip = "Quick Look \(att.filename)"
+        previewArea.onClick = { [weak self] in self?.previewAttachment(at: index) }
+        let inner = NSStackView(views: [clip, label])
+        inner.orientation = .horizontal
+        inner.alignment = .centerY
+        inner.spacing = 7
+        inner.translatesAutoresizingMaskIntoConstraints = false
+        previewArea.addSubview(inner)
+        NSLayoutConstraint.activate([
+            inner.leadingAnchor.constraint(equalTo: previewArea.leadingAnchor),
+            inner.trailingAnchor.constraint(equalTo: previewArea.trailingAnchor),
+            inner.topAnchor.constraint(equalTo: previewArea.topAnchor),
+            inner.bottomAnchor.constraint(equalTo: previewArea.bottomAnchor),
+        ])
+
         let download = NSButton(image: NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: "Download")!,
                                 target: self, action: #selector(downloadAttachmentButton(_:)))
         download.translatesAutoresizingMaskIntoConstraints = false
@@ -414,7 +387,7 @@ final class EmailDetailViewController: NSViewController {
         download.toolTip = "Download \(att.filename)"
         download.setContentHuggingPriority(.required, for: .horizontal)
 
-        let stack = NSStackView(views: [clip, label, download])
+        let stack = NSStackView(views: [previewArea, download])
         stack.orientation = .horizontal
         stack.alignment = .centerY
         stack.spacing = 7
@@ -431,6 +404,18 @@ final class EmailDetailViewController: NSViewController {
 
     @objc private func downloadAttachmentButton(_ sender: NSButton) {
         downloadAttachment(at: sender.tag)
+    }
+
+    private func previewAttachment(at index: Int) {
+        guard index >= 0, index < attachments.count else { return }
+        let att = attachments[index]
+        Task {
+            let data = await GmailFetcher.shared.attachmentData(emailID: email.id, attachmentId: att.id)
+            await MainActor.run {
+                guard let data else { return }
+                QuickLookPreview.shared.show(data: data, filename: att.filename)
+            }
+        }
     }
 
     private func downloadAttachment(at index: Int) {
@@ -481,22 +466,35 @@ final class EmailDetailViewController: NSViewController {
     // MARK: - HTML rendering (HTML emails only)
 
     private func htmlDocument(html: String, attachments: [EmailAttachment]) -> String {
-        page(content: html + attachmentsHTML(attachments))
+        let hasRemote = html.range(of: "(?i)src\\s*=\\s*[\"']?https?:", options: .regularExpression) != nil
+        let block = !showRemoteImages && hasRemote
+        var body = ""
+        if block {
+            body += "<div class='img-banner'>Remote images blocked for privacy. "
+                  + "<a href='loadimages://now'>Load images</a></div>"
+        }
+        body += html + attachmentsHTML(attachments)
+        return page(content: body, blockImages: !showRemoteImages)
     }
 
     private func attachmentsHTML(_ attachments: [EmailAttachment]) -> String {
         guard !attachments.isEmpty else { return "" }
         var section = "<div class='attachments'><div class='att-title'>Attachments</div>"
         for (i, att) in attachments.enumerated() {
-            // The chip itself isn't a link; only the ↓ icon downloads.
-            section += "<span class='att'>📎 <span class='att-name'>\(att.filename.htmlEscaped)</span> "
+            // Name → Quick Look preview; ↓ → download.
+            section += "<span class='att'>"
+                     + "<a class='att-name' href='attachment://preview/\(i)' title='Quick Look'>📎 \(att.filename.htmlEscaped)</a> "
                      + "<span class='att-size'>· \(att.displaySize)</span>"
-                     + "<a class='att-dl' href='attachment://download/\(i)' title='Download'>&#8595;</a></span>"
+                     + "<a class='att-dl' href='attachment://save/\(i)' title='Download'>&#8595;</a></span>"
         }
         return section + "</div>"
     }
 
-    private func page(content: String) -> String {
+    private func page(content: String, blockImages: Bool = true) -> String {
+        // CSP restricting images to inline data: blocks remote images (trackers).
+        let csp = blockImages
+            ? "<meta http-equiv='Content-Security-Policy' content=\"img-src data:;\">"
+            : ""
         let isDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         let bg     = isDark ? "#1e1e1e" : "#ffffff"
         let text   = isDark ? "#e0e0e0" : "#1a1a1a"
@@ -510,6 +508,7 @@ final class EmailDetailViewController: NSViewController {
         <html>
         <head>
         <meta charset='utf-8'>
+        \(csp)
         <meta name='viewport' content='width=device-width,initial-scale=1'>
         <style>
           html { -webkit-text-size-adjust: 100%; }
@@ -520,6 +519,10 @@ final class EmailDetailViewController: NSViewController {
           .subject { font-size:15px; font-weight:700; color:\(sub); margin-bottom:4px; }
           .meta    { font-size:11px; color:\(meta); margin-bottom:14px;
                      padding-bottom:12px; border-bottom:1px solid \(border); }
+          .img-banner { font-size:11.5px; color:\(meta); background:\(chip);
+                        border:1px solid \(border); border-radius:8px;
+                        padding:7px 11px; margin-bottom:12px; }
+          .img-banner a { color:#0a84ff; text-decoration:none; font-weight:600; }
           img      { max-width:100%; height:auto; }
           table    { max-width:100%; }
           pre      { white-space:pre-wrap; }
@@ -579,6 +582,13 @@ private final class LinkTextView: NSTextView {
     }
 }
 
+/// A plain view that runs a closure when clicked (used for the attachment chip body).
+private final class ClickableView: NSView {
+    var onClick: (() -> Void)?
+    override func mouseDown(with event: NSEvent) { onClick?() }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+}
+
 // MARK: - Navigation: attachment downloads + external links
 
 extension EmailDetailViewController: WKNavigationDelegate {
@@ -586,9 +596,17 @@ extension EmailDetailViewController: WKNavigationDelegate {
                  decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         if let url = navigationAction.request.url {
+            if url.scheme == "loadimages" {     // user opted to load remote images
+                showRemoteImages = true
+                reloadHTML()
+                decisionHandler(.cancel)
+                return
+            }
             if url.scheme == "attachment" {
+                // attachment://preview/<index>  or  attachment://save/<index>
                 if let last = url.pathComponents.last, let index = Int(last) {
-                    downloadAttachment(at: index)
+                    if url.host == "save" { downloadAttachment(at: index) }
+                    else { previewAttachment(at: index) }
                 }
                 decisionHandler(.cancel)
                 return

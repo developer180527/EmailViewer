@@ -184,6 +184,12 @@ actor GmailFetcher {
         return cachedEmails
     }
 
+    /// Looks up a cached email by id (e.g. when a notification is tapped).
+    func email(withID id: String) -> Email? {
+        hydrateIfNeeded()
+        return cachedEmails.first { $0.id == id }
+    }
+
     /// True when the cached list is older than `maxAge` (or absent).
     func isListStale(maxAge: TimeInterval) -> Bool {
         hydrateIfNeeded()
@@ -239,26 +245,6 @@ actor GmailFetcher {
     /// Downloads a single attachment's bytes (used when the user saves it).
     func attachmentData(emailID: String, attachmentId: String) async -> Data? {
         await fetchAttachment(emailID: emailID, attachmentId: attachmentId)
-    }
-
-    // MARK: - Trash (move to Gmail Trash — reversible; needs gmail.modify scope)
-
-    func trash(_ emailID: String) async throws {
-        let url = URL(string: "\(baseURL)/messages/\(emailID)/trash")!
-        do {
-            _ = try await authorizedData(url: url, method: "POST")
-        } catch let GmailError.http(403, body) {
-            let text = (body ?? "").lowercased()
-            if text.contains("insufficient") || text.contains("scope") {
-                throw GmailError.insufficientScope
-            }
-            throw GmailError.http(403, body)
-        }
-        cachedEmails.removeAll { $0.id == emailID }
-        contentCache[emailID] = nil
-        contentOrder.removeAll { $0 == emailID }
-        deleteContentFromDisk(emailID)
-        saveToDisk()
     }
 
     // MARK: - Account
@@ -346,7 +332,8 @@ actor GmailFetcher {
         guard !didHydrate else { return }
         didHydrate = true
         guard let url = diskURL(),
-              let data = try? Data(contentsOf: url),
+              let blob = try? Data(contentsOf: url),
+              let data = CacheCrypto.decrypt(blob),
               let payload = try? JSONDecoder().decode(DiskPayload.self, from: data)
         else { return }
         cachedEmails  = payload.emails
@@ -359,8 +346,9 @@ actor GmailFetcher {
         guard let url = diskURL() else { return }
         let payload = DiskPayload(emails: cachedEmails, savedAt: lastListFetch ?? Date(),
                                   historyId: lastHistoryId, seenIDs: Array(seenIDs))
-        guard let data = try? JSONEncoder().encode(payload) else { return }
-        try? data.write(to: url, options: .atomic)
+        guard let data = try? JSONEncoder().encode(payload),
+              let blob = CacheCrypto.encrypt(data) else { return }
+        try? blob.write(to: url, options: .atomic)
     }
 
     private func clearDisk() {
@@ -399,13 +387,15 @@ actor GmailFetcher {
     }
 
     private func loadContentFromDisk(_ emailID: String) -> EmailContent? {
-        guard let url = bodyFile(emailID), let data = try? Data(contentsOf: url) else { return nil }
+        guard let url = bodyFile(emailID), let blob = try? Data(contentsOf: url),
+              let data = CacheCrypto.decrypt(blob) else { return nil }
         return try? JSONDecoder().decode(EmailContent.self, from: data)
     }
 
     private func saveContentToDisk(_ content: EmailContent, for emailID: String) {
-        guard let url = bodyFile(emailID), let data = try? JSONEncoder().encode(content) else { return }
-        try? data.write(to: url, options: .atomic)
+        guard let url = bodyFile(emailID), let data = try? JSONEncoder().encode(content),
+              let blob = CacheCrypto.encrypt(data) else { return }
+        try? blob.write(to: url, options: .atomic)
         pruneDiskBodies()
     }
 
@@ -666,7 +656,6 @@ actor GmailFetcher {
         case rateLimited
         case server(Int)
         case http(Int, String?)
-        case insufficientScope
 
         var errorDescription: String? {
             switch self {
@@ -674,16 +663,12 @@ actor GmailFetcher {
             case .rateLimited:  return "Gmail is rate-limiting requests. Try again shortly."
             case .server(let c): return "Gmail had a server error (\(c)). Try again shortly."
             case .http(let c, _): return "Gmail request failed (HTTP \(c))."
-            case .insufficientScope:
-                return "Reconnect Gmail to enable delete (it needs broader permission)."
             }
         }
 
         var requiresReauth: Bool {
-            switch self {
-            case .unauthorized, .insufficientScope: return true
-            default: return false
-            }
+            if case .unauthorized = self { return true }
+            return false
         }
     }
 

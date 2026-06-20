@@ -14,6 +14,8 @@ final class RootViewController: NSViewController {
 
     private let contentContainer = NSView()
 
+    private var keyMonitor: Any?
+
     private lazy var toolbar: NSView = {
         let v = NSView()
         v.translatesAutoresizingMaskIntoConstraints = false
@@ -38,6 +40,32 @@ final class RootViewController: NSViewController {
 
         listVC.onSelectEmail = { [weak self] email in self?.pushDetail(for: email) }
         show(listVC)
+    }
+
+    // MARK: - Keyboard
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, event.window === self.view.window else { return event }
+            return self.handleKey(event) ? nil : event
+        }
+    }
+
+    override func viewDidDisappear() {
+        super.viewDidDisappear()
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor); self.keyMonitor = nil }
+    }
+
+    /// Returns true if the event was consumed.
+    private func handleKey(_ event: NSEvent) -> Bool {
+        if let detail = currentChild as? EmailDetailViewController {
+            if event.keyCode == 53 { detail.goBackFromKeyboard(); return true }       // esc → back
+            return false
+        }
+        if currentChild === listVC { return listVC.handleListKey(event) }
+        return false
     }
 
     // MARK: - Layout
@@ -87,12 +115,14 @@ final class RootViewController: NSViewController {
 
     private func pushDetail(for email: Email) {
         let detail = EmailDetailViewController(email: email)
-        detail.onBack    = { [weak self] in self?.popToList() }
-        detail.onDeleted = { [weak self] in self?.popToList() }   // email already removed + list refreshed
+        detail.onBack = { [weak self] in self?.popToList() }
         show(detail, direction: .forward)
     }
 
     func popToList() { show(listVC, direction: .back) }
+
+    /// Opens a specific email's detail (used when a notification is tapped).
+    func openEmail(_ email: Email) { pushDetail(for: email) }
 
     func handleSignInCompleted() {
         popToList()

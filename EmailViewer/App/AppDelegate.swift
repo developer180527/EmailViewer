@@ -38,7 +38,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // Called when Google redirects back after OAuth (legacy custom-scheme path;
     // the primary flow completes inside ASWebAuthenticationSession).
     func application(_ application: NSApplication, open urls: [URL]) {
-        print("📲 Received URL: \(urls.first?.absoluteString ?? "none")")
+        // Don't log the full URL — it carries the one-time OAuth code.
+        print("📲 Received OAuth redirect")
         guard let url = urls.first else { return }
         Task {
             do {
@@ -175,11 +176,20 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
         completionHandler([.banner, .sound])
     }
 
-    // Tapping a notification opens the inbox popover.
+    // Tapping a notification opens the popover and jumps straight to that email.
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         showPopover()
+        if let id = response.notification.request.content.userInfo["emailID"] as? String {
+            Task {
+                if let email = await GmailFetcher.shared.email(withID: id) {
+                    await MainActor.run {
+                        (self.popover.contentViewController as? RootViewController)?.openEmail(email)
+                    }
+                }
+            }
+        }
         completionHandler()
     }
 }

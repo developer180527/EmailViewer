@@ -13,9 +13,8 @@ extension Notification.Name {
 enum GmailConfig {
     nonisolated static let clientID    = "941618878714-t4buls3u2j9mq2muinecbq0pgqg0afbt.apps.googleusercontent.com"
     nonisolated static let redirectURI = "com.googleusercontent.apps.941618878714-t4buls3u2j9mq2muinecbq0pgqg0afbt:/oauth2callback"
-    // gmail.modify = read + label/trash (no permanent delete, no send). Needed for
-    // moving messages to Trash. Existing readonly sessions must reconnect to upgrade.
-    nonisolated static let scope       = "https://www.googleapis.com/auth/gmail.modify"
+    // Read-only: the app is a viewer. No write/trash/send access at all.
+    nonisolated static let scope       = "https://www.googleapis.com/auth/gmail.readonly"
     nonisolated static let tokenURL    = "https://oauth2.googleapis.com/token"
     nonisolated static let authBaseURL = "https://accounts.google.com/o/oauth2/v2/auth"
 
@@ -140,10 +139,15 @@ final class GmailAuthManager: NSObject {  // must inherit NSObject for ASWebAuth
 
     func signOut() {
         hasSession = false
+        // Grab the refresh token before wiping so we can revoke the grant with Google.
+        let refreshToken = KeychainHelper.load(key: GmailConfig.Keys.refreshToken)
         KeychainHelper.delete(key: GmailConfig.Keys.accessToken)
         KeychainHelper.delete(key: GmailConfig.Keys.refreshToken)
         KeychainHelper.delete(key: GmailConfig.Keys.expiry)
-        Task { await GmailTokenStore.shared.clearMemory() }
+        Task {
+            await GmailTokenStore.shared.clearMemory()
+            if let refreshToken { await GmailTokenStore.revoke(token: refreshToken) }
+        }
         print("👋 Signed out")
         NotificationCenter.default.post(name: .gmailAuthChanged, object: nil)
     }
@@ -252,7 +256,7 @@ actor GmailTokenStore {
         let (data, response) = try await URLSession.shared.data(for: request)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else {
             let body = String(data: data, encoding: .utf8) ?? ""
-            print("❌ Token exchange failed: \(body)")
+            print("❌ Token exchange failed (HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0))")
             throw GmailAuthManager.AuthError.tokenExchangeFailed(body)
         }
 
@@ -268,6 +272,17 @@ actor GmailTokenStore {
         expiresAt   = nil
         refreshTask?.cancel()
         refreshTask = nil
+    }
+
+    /// Tells Google to invalidate the grant, so a leaked token is dead server-side
+    /// — not just deleted locally. Best-effort.
+    static func revoke(token: String) async {
+        guard let url = URL(string: "https://oauth2.googleapis.com/revoke") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.httpBody = "token=\(token)".data(using: .utf8)
+        _ = try? await URLSession.shared.data(for: request)
     }
 
     // MARK: Internals
@@ -296,7 +311,7 @@ actor GmailTokenStore {
 
         // 400 / 401 (invalid_grant) => the refresh token is revoked/expired.
         if status == 400 || status == 401 {
-            print("❌ Refresh rejected (\(status)): \(String(data: data, encoding: .utf8) ?? "")")
+            print("❌ Refresh rejected (HTTP \(status))")
             wipe()
             throw GmailAuthManager.AuthError.reauthenticationRequired
         }

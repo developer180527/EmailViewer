@@ -6,6 +6,7 @@ final class MailViewController: NSViewController {
     /// Called when the user taps an email; the container handles navigation.
     var onSelectEmail: ((Email) -> Void)?
 
+    private var focusedRow = -1             // keyboard-navigation focus
     private var allEmails: [Email] = []     // full inbox
     private var emails:    [Email] = []     // filtered/displayed
     private var searchQuery = ""
@@ -146,22 +147,11 @@ final class MailViewController: NSViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         buildLayout()
-        setupContextMenu()
         NotificationCenter.default.addObserver(self, selector: #selector(authChanged),
                                                name: .gmailAuthChanged, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(inboxDidUpdate),
                                                name: .inboxDidUpdate, object: nil)
         updateUI()
-    }
-
-    private func setupContextMenu() {
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-        menu.delegate = self
-        let delete = NSMenuItem(title: "Move to Trash", action: #selector(deleteClickedRow), keyEquivalent: "")
-        delete.target = self
-        menu.addItem(delete)
-        tableView.menu = menu
     }
 
     override func viewDidAppear() {
@@ -264,6 +254,7 @@ final class MailViewController: NSViewController {
                 .sorted { $0.1 > $1.1 }
                 .map(\.0)
         }
+        focusedRow = -1
         tableView.reloadData()
         updateEmptyState()
     }
@@ -411,22 +402,13 @@ extension MailViewController: NSSearchFieldDelegate {
     }
 }
 
-// MARK: - Context menu
-
-extension MailViewController: NSMenuDelegate {
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        let valid = tableView.clickedRow >= 0 && tableView.clickedRow < emails.count
-        menu.items.forEach { $0.isEnabled = valid }
-    }
-}
-
 // MARK: - Table DataSource & Delegate
 
 extension MailViewController: NSTableViewDataSource, NSTableViewDelegate {
 
     func numberOfRows(in tableView: NSTableView) -> Int { emails.count }
 
-    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { 70 }
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { 72 }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let cell = EmailCellView()
@@ -434,7 +416,11 @@ extension MailViewController: NSTableViewDataSource, NSTableViewDelegate {
         return cell
     }
 
-    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { MailRowView() }
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        let v = MailRowView()
+        v.isFocused = (row == focusedRow)   // keep keyboard focus visible across scroll/reload
+        return v
+    }
 
     // Hand selection to the container, which navigates to the detail view.
     func tableViewSelectionDidChange(_ notification: Notification) {
@@ -446,41 +432,85 @@ extension MailViewController: NSTableViewDataSource, NSTableViewDelegate {
         onSelectEmail?(email)
     }
 
-    // MARK: - Delete (context menu)
+    // MARK: - Keyboard navigation (driven by RootViewController's key monitor)
 
-    @objc private func deleteClickedRow() {
-        let row = tableView.clickedRow
-        guard row >= 0, row < emails.count else { return }
-        deleteEmail(emails[row])
-    }
+    /// Returns true if the key was handled.
+    func handleListKey(_ event: NSEvent) -> Bool {
+        let cmd = event.modifierFlags.contains(.command)
+        let chars = (event.charactersIgnoringModifiers ?? "").lowercased()
+        let searching = (searchField.currentEditor() != nil)   // actively typing a query?
 
-    private func deleteEmail(_ email: Email) {
-        // Optimistic removal; restored if the trash request fails.
-        allEmails.removeAll { $0.id == email.id }
-        applyFilter()
-        Task {
-            do {
-                try await GmailFetcher.shared.trash(email.id)
-                NotificationCenter.default.post(name: .inboxDidUpdate, object: nil)
-            } catch {
-                self.setEmails(await GmailFetcher.shared.currentEmails())   // restore
-                self.handleDeleteError(error)
+        if cmd && chars == "r" { loadEmails(forceRefresh: true); return true }
+        if cmd && chars == "f" { focusSearch(); return true }
+
+        // While typing in the search box, only ↓ (into list) and Esc are special.
+        if searching {
+            switch event.keyCode {
+            case 125:   // ↓ : move from search into the list
+                view.window?.makeFirstResponder(tableView)
+                moveFocus(by: focusedRow < 0 ? 0 : 1)
+                if focusedRow < 0 { setFocus(0) }
+                return true
+            case 53:    // esc : clear, then blur
+                if !searchField.stringValue.isEmpty {
+                    searchField.stringValue = ""; searchQuery = ""; applyFilter()
+                } else {
+                    view.window?.makeFirstResponder(tableView)
+                }
+                return true
+            default:
+                return false   // let the field handle typing/←→/return
             }
         }
+
+        // List has focus → full navigation.
+        switch event.keyCode {
+        case 126: moveFocus(by: -1); return true            // ↑
+        case 125: moveFocus(by: 1);  return true            // ↓
+        case 36, 76: openFocused(); return true             // return / enter
+        case 53:                                            // esc → clear search if any
+            if !searchField.stringValue.isEmpty {
+                searchField.stringValue = ""; searchQuery = ""; applyFilter(); return true
+            }
+            return false
+        default: break
+        }
+        if chars == "j" { moveFocus(by: 1);  return true }
+        if chars == "k" { moveFocus(by: -1); return true }
+        return false
     }
 
-    private func handleDeleteError(_ error: Error) {
-        let needsReauth = (error as? GmailFetcher.GmailError)?.requiresReauth == true
-        let alert = NSAlert()
-        alert.messageText = "Couldn't delete email"
-        alert.informativeText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-        alert.alertStyle = .warning
-        if needsReauth { alert.addButton(withTitle: "Reconnect") }
-        alert.addButton(withTitle: "OK")
-        NSApp.activate(ignoringOtherApps: true)
-        if needsReauth, alert.runModal() == .alertFirstButtonReturn {
-            Task { try? await GmailAuthManager.shared.startOAuthFlow() }
+    func focusSearch() { view.window?.makeFirstResponder(searchField) }
+
+    func selectFilter(_ filter: InboxFilter) { filterBar.select(filter) }
+
+    private func moveFocus(by delta: Int) {
+        guard !emails.isEmpty else { return }
+        let start = focusedRow < 0 ? (delta > 0 ? -1 : emails.count) : focusedRow
+        setFocus(max(0, min(emails.count - 1, start + delta)))
+        if focusedRow >= 0 { tableView.scrollRowToVisible(focusedRow) }
+    }
+
+    private func setFocus(_ row: Int) {
+        guard row != focusedRow else { return }
+        focusRowView(focusedRow)?.isFocused = false
+        focusedRow = row
+        focusRowView(row)?.isFocused = true
+    }
+
+    private func focusRowView(_ row: Int) -> MailRowView? {
+        guard row >= 0, row < emails.count else { return nil }
+        return tableView.rowView(atRow: row, makeIfNecessary: false) as? MailRowView
+    }
+
+    private func openFocused() {
+        guard focusedRow >= 0, focusedRow < emails.count else {
+            if !emails.isEmpty { setFocus(0) }
+            return
         }
+        let email = emails[focusedRow]
+        markReadLocally(email)
+        onSelectEmail?(email)
     }
 
     /// Clears the unread state when an email is opened. Read-only scope means this
@@ -501,17 +531,17 @@ extension MailViewController: NSTableViewDataSource, NSTableViewDelegate {
 // MARK: - Row View (hover highlight)
 
 final class MailRowView: NSTableRowView {
-    var isHovered = false {
-        didSet { if isHovered != oldValue { needsDisplay = true } }
-    }
+    var isHovered = false { didSet { if isHovered != oldValue { needsDisplay = true } } }
+    var isFocused = false { didSet { if isFocused != oldValue { needsDisplay = true } } }  // keyboard nav
     override var isEmphasized: Bool { get { false } set {} }
 
     override func drawBackground(in dirtyRect: NSRect) {
         super.drawBackground(in: dirtyRect)
-        guard isHovered else { return }
+        guard isHovered || isFocused else { return }
         let rect = bounds.insetBy(dx: 7, dy: 3)
         let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
-        NSColor.labelColor.withAlphaComponent(0.07).setFill()
+        let alpha: CGFloat = isFocused ? 0.11 : 0.07
+        NSColor.labelColor.withAlphaComponent(alpha).setFill()
         path.fill()
     }
 }
